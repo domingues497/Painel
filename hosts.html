@@ -27,7 +27,7 @@ table{min-width:900px}
     <a href="/hosts.html?view=workstations" data-view="workstations">Computadores</a>
     <a href="/hosts.html?view=all" data-view="all">Todos os hosts</a>
     <a href="/rede.html">Rede</a>
-    <a href="/executivo.html">Executivo</a>
+    <a class="admin-only" href="/executivo.html">Executivo</a>
   </nav>
   <div class="layout-actions"><span class="updated" id="updated"></span><button class="layout-edit-toggle" id="layout-edit-toggle" type="button" aria-pressed="false">Editar painel</button></div>
 </div>
@@ -1458,5 +1458,5 @@ window.addEventListener("resize", () => {
 refresh();
 setInterval(refresh, REFRESH_MS);
 </script>
-</body>
+<script src="/static/admin-nav.js"></script></body>
 </html>

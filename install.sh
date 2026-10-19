@@ -41,8 +41,19 @@ if [ -d "$APP_DIR/.git" ]; then
   sudo -u "$SERVICE_USER" git -C "$APP_DIR" fetch --all --prune
   sudo -u "$SERVICE_USER" git -C "$APP_DIR" pull --ff-only
 else
+  # Primeira instalação (ou diretório pré-existente sem repositório):
+  # clona em uma pasta temporária e só depois substitui o conteúdo alvo,
+  # preservando arquivos locais que não vêm do Git (.env e estado).
+  TMP_DIR="${APP_DIR}.new.$$"
+  rm -rf "$TMP_DIR"
+  echo "   Clonando repositório (diretório ${APP_DIR} já existe)..."
+  GIT_TERMINAL_PROMPT=0 git clone "$REPO_URL" "$TMP_DIR"
   mkdir -p "$APP_DIR"
-  GIT_TERMINAL_PROMPT=0 git clone "$REPO_URL" "$APP_DIR"
+  for f in .env alert_config.json alert_state.json; do
+    [ -f "$APP_DIR/$f" ] && cp -a "$APP_DIR/$f" "$TMP_DIR/$f"
+  done
+  rm -rf "$APP_DIR"
+  mv "$TMP_DIR" "$APP_DIR"
 fi
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
 

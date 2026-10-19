@@ -8,7 +8,7 @@
 main>.card,main>p,.lead{max-width:850px;margin-left:auto;margin-right:auto}
 .card{margin-top:22px;padding:24px}.status{display:none}.top h1{margin:0}
 </style></head><body><main>
-<div class="top"><h1>Conexão com o Zabbix</h1><nav class="nav" aria-label="Painéis"><a href="/">Switches</a><a href="/hosts.html?view=servers">Servidores</a><a href="/hosts.html?view=workstations">Computadores</a><a href="/hosts.html?view=all">Todos os hosts</a><a href="/rede.html">Rede</a><a href="/executivo.html">Executivo</a><a href="/configuracao.html" aria-current="page">Configuração</a></nav></div>
+<div class="top"><h1>Conexão com o Zabbix</h1><nav class="nav" aria-label="Painéis"><a href="/">Switches</a><a href="/hosts.html?view=servers">Servidores</a><a href="/hosts.html?view=workstations">Computadores</a><a href="/hosts.html?view=all">Todos os hosts</a><a href="/rede.html">Rede</a><a class="admin-only" href="/executivo.html">Executivo</a><a class="admin-only" href="/configuracao.html" aria-current="page">Configuração</a></nav></div>
 <p class="lead">Configure e teste a conexão com a API antes de salvar.</p>
 <section class="card"><form id="form"><div class="grid">
 <div class="full"><label for="url">URL da API</label><input id="url" type="url" required placeholder="http://172.24.100.160/zabbix/api_jsonrpc.php"><div class="help">Informe o endpoint JSON-RPC completo.</div></div>
@@ -28,4 +28,4 @@ function show(msg,ok){$('status').className='status '+(ok?'ok':'bad');$('status'
 async function send(path){const b=path.endsWith('/test')?$('test'):$('form').querySelector('button[type=submit]');b.disabled=true;try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});const d=await r.json();if(!r.ok)throw Error(d.detail||'Falha inesperada');show(path.endsWith('/test')?'Conexão realizada. Versão do Zabbix: '+d.version+'.':d.message,true);if(path.endsWith('/save')){$('token').value='';$('password').value=''}}catch(e){show(e.message,false)}finally{b.disabled=false}}
 $('test').onclick=()=>send('/api/settings/test');$('form').onsubmit=e=>{e.preventDefault();send('/api/settings/save')};
 fetch('/api/settings').then(r=>r.json()).then(c=>{if(c.url)$('url').value=c.url;if(c.auth_type)$('auth_type').value=c.auth_type;if(c.username)$('username').value=c.username;$('verify_tls').checked=!!c.verify_tls;updateAuth()}).catch(()=>{});
-</script></body></html>
+</script><script src="/static/admin-nav.js"></script></body></html>
