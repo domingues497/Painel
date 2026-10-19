@@ -1,0 +1,821 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rede</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;600&family=Barlow+Condensed:wght@500;600&display=swap">
+<link rel="stylesheet" href="/static/ui.css">
+<style>
+:root{--row-label:120px}
+.stats{position:relative;display:block;width:100%;min-height:100px;margin-bottom:6px}
+.ranks{position:relative;display:block;width:100%;min-height:240px}
+.cards{position:relative;display:block;width:100%;min-height:220px}
+table.big{min-width:1250px}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>Rede e infraestrutura</h1>
+  <nav class="nav" aria-label="Painéis">
+    <a href="/">Switches</a>
+    <a href="/hosts.html?view=servers">Servidores</a>
+    <a href="/hosts.html?view=workstations">Computadores</a>
+    <a href="/hosts.html?view=all">Todos os hosts</a>
+    <a href="/rede.html" aria-current="page">Rede</a>
+    <a href="/executivo.html">Executivo</a>
+  </nav>
+  <div class="layout-actions"><span class="updated" id="updated"></span><button class="layout-edit-toggle" id="layout-edit-toggle" type="button" aria-pressed="false">Editar painel</button></div>
+</div>
+<p class="banner" id="banner" hidden></p>
+<section class="stats" id="stats" aria-label="Resumo"></section>
+
+<section id="wan" aria-label="Links WAN"></section>
+
+<h2 class="sec">Interfaces</h2>
+<section class="ranks" id="ranks"></section>
+
+<h2 class="sec">Equipamentos</h2>
+<div class="tools">
+  <label>Buscar <input id="q" type="search" placeholder="Nome do equipamento"></label>
+  <label>Mostrar
+    <select id="f">
+      <option value="all">Todos</option>
+      <option value="online">Online</option>
+      <option value="offline">Sem resposta</option>
+      <option value="problems">Com problemas</option>
+      <option value="collection">Coleta com falha</option>
+    </select>
+  </label>
+</div>
+<main id="content" aria-live="polite"></main>
+
+<h2 class="sec">Pendentes de coleta</h2>
+<section class="pending" id="pending"></section>
+
+<p class="foot">Limites: perda de pacotes 1% (atenção) e 5% (crítico); uso de link 80% e 90%; CPU e memória 80% e 90%. Latência e temperatura não têm limite fixo: dependem da linha de base e do fabricante. O estado vem do ping (ICMP) quando o host tem esse item; sem ele, da disponibilidade da interface SNMP. Valores ausentes aparecem como "–", nunca como zero.</p>
+
+<script src="/static/no-overlap.js"></script>
+<script src="/static/edit-ux.js"></script>
+<script>
+const REFRESH_MS = 20000;
+const T_UTIL = [80, 90], T_LOSS = [1, 5], T_LOAD = [80, 90];
+const SEV = ["Sem classificação", "Informação", "Aviso", "Média", "Alta", "Desastre"];
+const STATUS = { online: "Online", offline: "Sem resposta", unknown: "Sem dados" };
+const STATUS_W = { offline: 0, unknown: 1, online: 2 };
+const ROLE = { switch: "Switch", device: "Equipamento", wan: "Link WAN" };
+
+let data = null, lastOk = null, query = "", statusFilter = "all", sort = { key: "status", dir: 1 };
+
+const h = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "style") e.style.cssText = v; else e.setAttribute(k, v);
+  }
+  e.append(...kids.filter(k => k !== null && k !== undefined));
+  return e;
+};
+const fmt = (n, d = 0) => n.toLocaleString("pt-BR", { maximumFractionDigits: d, minimumFractionDigits: d });
+const level = (v, [warn, crit]) => (v >= crit ? "crit" : v >= warn ? "warn" : "ok");
+const isNum = v => v !== null && v !== undefined;
+
+function fmtBps(v) {
+  if (!isNum(v)) return "–";
+  if (v >= 1e9) return fmt(v / 1e9, 2) + " Gbit/s";
+  if (v >= 1e6) return fmt(v / 1e6, 1) + " Mbit/s";
+  if (v >= 1e3) return fmt(v / 1e3, 0) + " kbit/s";
+  return fmt(v, 0) + " bit/s";
+}
+const fmtMs = v => (isNum(v) ? `${fmt(v, v < 10 ? 1 : 0)} ms` : "–");
+function fmtAge(s) { const m = Math.round(s / 60); return m < 90 ? `há ${m} min` : `há ${Math.round(m / 60)} h`; }
+
+function meter(v, label, thresholds) {
+  if (!isNum(v)) return h("span", { class: "na" }, "–");
+  const pct = Math.max(0, Math.min(100, v));
+  return h("span", { class: "meter-wrap" },
+    h("span", { class: `meter ${level(pct, thresholds)}`, role: "meter", "aria-label": label, "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": Math.round(pct) },
+      h("i", { style: `width:${pct}%` })),
+    h("span", { class: "val" }, `${fmt(pct)}%`));
+}
+function lossChip(v) {
+  if (!isNum(v)) return h("span", { class: "na" }, "–");
+  const cls = v >= T_LOSS[1] ? "sev-4" : v >= T_LOSS[0] ? "sev-2" : "none";
+  return h("span", { class: `chip ${cls}` }, `${fmt(v, 1)}%`);
+}
+function problemChip(d) {
+  const p = d.problems;
+  if (!p.count) return h("span", { class: "chip none" }, "Nenhum");
+  const title = p.top.map(t => `${SEV[t.severity]}: ${t.name}`).join("\n");
+  return h("span", { class: `chip sev-${p.max}`, title }, `${p.count} ${p.count === 1 ? "problema" : "problemas"}`);
+}
+const statusBadge = d => h("span", { class: `status ${d.status}` }, h("span", { class: "dot" }), STATUS[d.status]);
+const availText = d => (isNum(d.availability) ? `${fmt(d.availability, 1)}%` : "–");
+
+/* Coleta: dado ausente, antigo ou não suportado nunca vira "tudo bem". */
+const isStale = d => d.status === "online" && isNum(d.age) && d.age > data.stale_seconds;
+function collectionIssues(d) {
+  const out = [];
+  if (d.status === "unknown") out.push("Sem dados de disponibilidade");
+  if (isStale(d)) out.push(`Dados antigos (${fmtAge(d.age)})`);
+  if (d.unsupported) out.push(`${d.unsupported} ${d.unsupported === 1 ? "item não suportado" : "itens não suportados"}`);
+  return out;
+}
+function collectionCell(d) {
+  const issues = collectionIssues(d);
+  if (!issues.length) return h("span", { class: "na" }, "OK");
+  return h("span", { class: "chip sev-2", title: issues.join("\n") }, issues[0] + (issues.length > 1 ? ` (+${issues.length - 1})` : ""));
+}
+
+/* ---------- Resumo ---------- */
+function renderStats() {
+  const all = data.devices, eq = all.filter(d => d.role !== "wan"), wanProbes = all.filter(d => d.role === "wan");
+  const count = (list, f) => list.filter(f).length;
+  const withAvail = all.filter(d => isNum(d.availability));
+  const avg = withAvail.length ? withAvail.reduce((a, d) => a + d.availability, 0) / withAvail.length : null;
+  const c = data.interfaces.counts;
+  // A maior parte dos links WAN é representada por interfaces do roteador,
+  // não por hosts de sonda separados. Prioriza as interfaces identificadas.
+  const wanIfs = data.interfaces.wan || [];
+  const knownWanIfs = wanIfs.filter(i => i.status === 1 || i.status === 2);
+  const wanSummary = wanIfs.length
+    ? (knownWanIfs.length ? `${count(knownWanIfs, i => i.status === 1)}/${wanIfs.length}` : "–")
+    : (wanProbes.length ? `${count(wanProbes, d => d.status === "online")}/${wanProbes.length}` : "–");
+  const items = [
+    ["online", `${count(eq, d => d.status === "online")}/${eq.length}`, "Equipamentos online"],
+    ["offline", String(count(eq, d => d.status === "offline")), "Sem resposta"],
+    ["online", wanSummary, "Links WAN online"],
+    ["", avg === null ? "–" : `${fmt(avg, 1)}%`, `Disponibilidade ${data.avail_hours} h (estimada por uptime/SNMP/ICMP)`],
+    ["problems", String(count(all, d => d.problems.count > 0)), "Com problemas"],
+    ["attention", String(c.saturated), `Interfaces com uso ≥ ${c.util_warn}%`],
+    ["attention", String(c.errors), "Interfaces com erros"],
+    ["attention", String(count(all, isStale)), "Dados antigos"],
+    ["attention", String(all.reduce((a, d) => a + (d.unsupported || 0), 0)), "Itens não suportados"],
+  ];
+  document.getElementById("stats").replaceChildren(
+    ...items.map(([cls, n, label]) => h("div", { class: `stat ${cls}` }, h("b", {}, n), h("span", {}, label))));
+  freeCardLayout("#stats", ".stat", "rede-stats", { minWidth: 145, minHeight: 74 });
+}
+
+/* ---------- Links WAN ---------- */
+function renderWan() {
+  const box = document.getElementById("wan");
+  const wan = data.devices.filter(d => d.role === "wan");
+  const ifs = data.interfaces.wan;
+  box.replaceChildren(h("h2", { class: "sec" }, "Links WAN"));
+  if (!wan.length && !ifs.length) {
+    box.append(h("p", { class: "empty" }, "Nenhum link WAN encontrado. Confirme que o host está em um grupo de rede (grupos com MikroTik também são reconhecidos). Marque as interfaces de Internet com WAN, Operadora ou ISP no nome/alias, ou configure WAN_IF_PATTERN no .env para incluir portas específicas. Alternativamente, crie sondas ICMP por operadora em um grupo listado em WAN_GROUPS."));
+    return;
+  }
+  if (wan.length) {
+    const grid = h("div", { class: "cards" });
+    for (const d of [...wan].sort((a, b) => a.name.localeCompare(b.name, "pt-BR"))) {
+      const card = h("article", { class: `srv ${d.status}` },
+        h("header", {}, h("span", { class: "dot", title: STATUS[d.status] }), h("h2", {}, d.name)));
+      if (d.status === "offline") card.append(h("p", { class: "down-msg" }, "Link sem resposta ao ping."));
+      card.append(
+        h("div", { class: "row" }, h("span", {}, "Latência"), h("span", {}, fmtMs(d.latency_ms))),
+        h("div", { class: "row" }, h("span", {}, "Perda de pacotes"), lossChip(d.loss_pct)),
+        h("div", { class: "row" }, h("span", {}, `Disponib. ${data.avail_hours} h`), h("span", {}, availText(d))));
+      const issues = collectionIssues(d);
+      if (issues.length) card.append(h("p", { class: "meta warn-text" }, "Coleta: " + issues.join(". ")));
+      if (d.problems.count) {
+        card.append(h("ul", { class: "issues" }, ...d.problems.top.map(t => h("li", {}, h("span", { class: `chip sev-${t.severity}` }, SEV[t.severity]), " ", t.name))));
+      }
+      grid.append(card);
+    }
+    box.append(grid);
+    freeCardLayout(grid, ".srv", "rede-wan-cards", { minWidth: 250, minHeight: 170 });
+  }
+  if (ifs.length) {
+    const head = h("tr", {}, ...["Interface", "Estado", "Entrada", "Saída", "Uso do link"].map(t => h("th", { class: "plain", scope: "col" }, t)));
+    const rows = ifs.map(i => h("tr", {},
+      h("td", {}, h("strong", {}, `${i.host} / ${i.name}`), i.alias ? ` (${i.alias})` : ""),
+      h("td", {}, i.status === 1 ? statusBadge({ status: "online" }) : i.status === null || i.status === undefined ? h("span", { class: "na" }, "–") : statusBadge({ status: "offline" })),
+      h("td", {}, fmtBps(i.in_bps)), h("td", {}, fmtBps(i.out_bps)),
+      h("td", {}, meter(i.util, "Uso do link", T_UTIL))));
+    box.append(h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, head), h("tbody", {}, ...rows))));
+  }
+}
+
+/* ---------- Rankings de interfaces ---------- */
+function ifLabel(i) { return `${i.host} / ${i.name}` + (i.alias ? ` (${i.alias})` : ""); }
+function renderRanks() {
+  const { top_util, top_errors } = data.interfaces;
+  const util = h("section", { class: "rank" }, h("h3", {}, "Maior utilização de link"),
+    top_util.length
+      ? h("ol", {}, ...top_util.map(i => h("li", {}, h("span", { class: "rname", title: ifLabel(i) }, ifLabel(i)), meter(i.util, "Uso do link", T_UTIL))))
+      : h("p", { class: "na" }, "Sem dados de velocidade e tráfego"));
+  const err = h("section", { class: "rank" }, h("h3", {}, "Erros e descartes (pacotes/s)"),
+    top_errors.length
+      ? h("ol", {}, ...top_errors.map(i => h("li", {}, h("span", { class: "rname", title: ifLabel(i) }, ifLabel(i)),
+          h("span", { class: `chip ${i.err >= 10 ? "sev-4" : "sev-2"}` }, fmt(i.err, 1)))))
+      : h("p", { class: "na" }, "Nenhuma interface com erros ou descartes"));
+  const ranksBoard = document.getElementById("ranks");
+  ranksBoard.replaceChildren(util, err);
+  freeCardLayout(ranksBoard, ".rank", "rede-rank-cards", { minWidth: 280, minHeight: 180 });
+}
+
+/* ---------- Tabela de equipamentos ---------- */
+function sortDefault(a, b) {
+  return STATUS_W[a.status] - STATUS_W[b.status] || b.problems.max - a.problems.max || a.name.localeCompare(b.name, "pt-BR");
+}
+const COLS = [
+  { key: "status", label: "Estado", val: d => STATUS_W[d.status], cell: statusBadge },
+  { key: "name", label: "Equipamento", val: d => d.name.toLowerCase(), cell: d => h("strong", {}, d.name) },
+  { key: "role", label: "Tipo", val: d => ROLE[d.role], cell: d => ROLE[d.role] },
+  { key: "lat", label: "Latência", val: d => d.latency_ms ?? -1, cell: d => fmtMs(d.latency_ms) },
+  { key: "loss", label: "Perda", val: d => d.loss_pct ?? -1, cell: d => lossChip(d.loss_pct) },
+  { key: "cpu", label: "CPU", val: d => d.cpu ?? -1, cell: d => meter(d.cpu, "CPU", T_LOAD) },
+  { key: "mem", label: "Memória", val: d => d.mem ?? -1, cell: d => meter(d.mem, "Memória", T_LOAD) },
+  { key: "temp", label: "Temp.", val: d => d.temp ?? -1, cell: d => (isNum(d.temp) ? `${fmt(d.temp, 0)} °C` : h("span", { class: "na" }, "–")) },
+  { key: "ports", label: "Portas", val: d => (d.ports ? d.ports.up : -1),
+    cell: d => (d.ports ? `${d.ports.up} ativas, ${d.ports.down} inativas` : h("span", { class: "na" }, "–")) },
+  { key: "util", label: "Maior uso de link", val: d => d.worst_util ?? -1, cell: d => meter(d.worst_util, "Maior uso de link", T_UTIL) },
+  { key: "err", label: "Erros/desc.", val: d => d.errors ?? -1,
+    cell: d => (!isNum(d.errors) ? h("span", { class: "na" }, "–") : d.errors > 0 ? h("span", { class: "chip sev-2" }, `${fmt(d.errors, 1)} pkt/s`) : "0") },
+  { key: "avail", label: "Disp.", val: d => d.availability ?? -1, cell: availText },
+  { key: "problems", label: "Problemas", val: d => (d.problems.count ? d.problems.max * 1000 + d.problems.count : -1), cell: problemChip },
+  { key: "collection", label: "Coleta", val: d => collectionIssues(d).length, cell: collectionCell },
+];
+
+function matchesFilter(d) {
+  if (statusFilter === "all") return true;
+  if (statusFilter === "problems") return d.problems.count > 0;
+  if (statusFilter === "collection") return collectionIssues(d).length > 0;
+  return d.status === statusFilter;
+}
+
+function renderTable() {
+  COLS.find(c => c.key === "avail").label = `Disp. ${data.avail_hours} h`;
+  const eq = data.devices.filter(d => d.role !== "wan");
+  const content = document.getElementById("content");
+  if (!eq.length) {
+    content.replaceChildren(h("p", { class: "empty" }, "Nenhum equipamento encontrado. Confira SWITCH_HOSTS, SWITCH_GROUPS e NETWORK_GROUPS no servidor."));
+    return;
+  }
+  const q = query.trim().toLowerCase();
+  const list = eq.filter(d => (!q || d.name.toLowerCase().includes(q)) && matchesFilter(d));
+  if (!list.length) { content.replaceChildren(h("p", { class: "empty" }, "Nenhum equipamento com esses filtros.")); return; }
+  const col = COLS.find(c => c.key === sort.key);
+  const rows = [...list].sort((a, b) => {
+    const x = col.val(a), y = col.val(b);
+    const r = x < y ? -1 : x > y ? 1 : 0;
+    return (r * sort.dir) || sortDefault(a, b);
+  });
+  const head = h("tr", {}, ...COLS.map(c => {
+    const th = h("th", { scope: "col", "aria-sort": c.key === sort.key ? (sort.dir === 1 ? "ascending" : "descending") : "none" });
+    const b = h("button", { type: "button" }, c.label);
+    b.addEventListener("click", () => {
+      sort = c.key === sort.key ? { key: c.key, dir: -sort.dir } : { key: c.key, dir: ["status", "name", "role"].includes(c.key) ? 1 : -1 };
+      renderTable();
+    });
+    th.append(b);
+    return th;
+  }));
+  const body = h("tbody", {}, ...rows.map(d => h("tr", {}, ...COLS.map(c => h("td", {}, c.cell(d))))));
+  content.replaceChildren(h("div", { class: "table-wrap" }, h("table", { class: "big" }, h("thead", {}, head), body)));
+}
+
+/* ---------- Pendências ---------- */
+function renderPending() {
+  const eq = data.devices.filter(d => d.role !== "wan");
+  const items = [...data.pending];
+  if (eq.length && !eq.some(d => isNum(d.temp))) items.push("Temperatura: nenhum equipamento expõe o sensor (chave sensor.temp.value)");
+  if (eq.length && !eq.some(d => isNum(d.cpu))) items.push("CPU dos equipamentos de rede");
+  if (eq.length && !eq.some(d => isNum(d.mem))) items.push("Memória dos equipamentos de rede");
+  document.getElementById("pending").replaceChildren(
+    h("p", {}, "Indicadores do projeto que este painel ainda não mostra, porque exigem template, script ou API específicos. Eles não aparecem como zero."),
+    h("ul", {}, ...items.map(t => h("li", {}, t))));
+}
+
+function render() {
+  renderStats(); renderWan(); renderRanks(); renderTable(); renderPending();
+}
+
+/* Edição de layout: mover/redimensionar e alterar leituras só ficam liberados ao clicar em Editar painel. */
+function isPanelLayoutEditing() { return document.body.classList.contains("layout-edit-active"); }
+function setupPanelEditMode() {
+  const button = document.getElementById("layout-edit-toggle");
+  if (!button || button.dataset.bound) return;
+  button.dataset.bound = "1";
+  let restoreButton = document.getElementById("restore-hidden-cards");
+  if (!restoreButton) {
+    restoreButton = document.createElement("button");
+    restoreButton.id = "restore-hidden-cards";
+    restoreButton.type = "button";
+    restoreButton.className = "layout-edit-toggle";
+    restoreButton.textContent = "Restaurar cards excluídos";
+    restoreButton.title = "Restaurar todos os cards ocultados nesta página";
+    restoreButton.hidden = true;
+    button.insertAdjacentElement("afterend", restoreButton);
+    restoreButton.addEventListener("click", () => {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith("painel-hidden-cards:")) localStorage.removeItem(key);
+      }
+      window.location.reload();
+    });
+  }
+  const setMode = enabled => {
+    restoreButton.hidden = !enabled;
+    document.body.classList.toggle("layout-edit-active", enabled);
+    button.setAttribute("aria-pressed", String(enabled));
+    button.textContent = enabled ? "Concluir edição" : "Editar painel";
+    button.title = enabled ? "Salvar o layout e sair do modo de edição" : "Liberar ajustes de layout e configuração dos itens Zabbix";
+    document.querySelectorAll(".free-card-managed").forEach(card => {
+      card.style.resize = enabled ? "both" : "none";
+      card.querySelectorAll(":scope > header, :scope > h3, :scope > .label").forEach(handle => { handle.style.cursor = enabled ? "grab" : "default"; });
+    });
+    document.querySelectorAll(".rank").forEach(card => { card.style.resize = enabled ? "both" : "none"; });
+    document.querySelectorAll(".rank-head").forEach(handle => { handle.style.cursor = enabled ? "grab" : "default"; handle.style.touchAction = enabled ? "none" : "auto"; });
+    if (!enabled) {
+      document.querySelectorAll(".rank-config").forEach(config => { config.hidden = true; });
+      document.querySelectorAll(".rank-menu-btn").forEach(menu => menu.setAttribute("aria-expanded", "false"));
+      document.querySelectorAll(".free-alignment-guide").forEach(guide => { guide.style.display = "none"; });
+    }
+    window.dispatchEvent(new CustomEvent("panel-layout-edit-change", { detail: { enabled } }));
+  };
+  button.addEventListener("click", () => setMode(!isPanelLayoutEditing()));
+  setMode(false);
+}
+setupPanelEditMode();
+
+let panelDataRevision = 0;
+// Pausa atualizações automáticas enquanto o usuário edita o layout. A mudança
+// de revisão invalida qualquer resposta HTTP que já estivesse em andamento.
+window.addEventListener("panel-layout-edit-change", event => {
+  panelDataRevision += 1;
+  if (!event.detail?.enabled) refresh();
+});
+
+function ensureFreeAlignmentGuides(parent) {
+  let vertical = parent.querySelector(":scope > .free-alignment-guide.vertical");
+  let horizontal = parent.querySelector(":scope > .free-alignment-guide.horizontal");
+  if (!vertical) { vertical = document.createElement("div"); vertical.className = "free-alignment-guide vertical"; vertical.setAttribute("aria-hidden", "true"); parent.appendChild(vertical); }
+  if (!horizontal) { horizontal = document.createElement("div"); horizontal.className = "free-alignment-guide horizontal"; horizontal.setAttribute("aria-hidden", "true"); parent.appendChild(horizontal); }
+  return { vertical, horizontal };
+}
+
+/* Layout livre comum: cartões podem ser movidos e redimensionados com o mouse.
+   Cada área salva suas coordenadas no navegador e restaura-as após a atualização. */
+function freeCardLayout(parentOrSelector, selector, storageName, options = {}) {
+  const parent = typeof parentOrSelector === "string" ? document.querySelector(parentOrSelector) : parentOrSelector;
+  if (!parent) return;
+  const cards = [...parent.querySelectorAll(`:scope > ${selector}`)];
+  if (!cards.length) return;
+  const gap = options.gap ?? 14;
+  const baseMinW = options.minWidth ?? 220;
+  // Largura mínima efetiva: a grade "N por linha" pode reduzi-la (guardado por grupo) para caber mais cards por linha.
+  try { parent._freeMinW = Number(localStorage.getItem(`painel-card-minw:${storageName}`)) || 0; } catch { parent._freeMinW = 0; }
+  const minW = () => Math.min(baseMinW, parent._freeMinW || baseMinW);
+  const minH = options.minHeight ?? 110;
+  const available = Math.max(320, parent.clientWidth || (window.innerWidth - 80));
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(`painel-free-cards:${storageName}`) || "{}") || {}; } catch {}
+  let hiddenCards = [];
+  try { hiddenCards = JSON.parse(localStorage.getItem(`painel-hidden-cards:${storageName}`) || "[]") || []; } catch {}
+  for (const card of cards) {
+    const titleNode = card.querySelector(":scope > header h2, :scope > h2, :scope > h3, :scope > .label, :scope > span, h2, h3, .label");
+    const title = card.dataset.freeOrigTitle || (titleNode?.textContent || card.className || "card").trim().replace(/\s+/g, " ").slice(0, 140);
+    const key = `${[...card.classList].filter(c => !["online", "offline", "unknown", "moving", "free-card-moving"].includes(c)).sort().join(".")}:${title}`;
+    if (hiddenCards.includes(key)) card.style.display = "none";
+  }
+  const visibleCards = cards.filter(card => card.style.display !== "none");
+  if (!visibleCards.length) {
+    parent.style.position = "relative"; parent.style.minHeight = "40px";
+    parent.dataset.freeStorageName = storageName;
+    return;
+  }
+  parent.style.position = "relative";
+  parent.style.display = "block";
+  parent.style.width = "100%";
+  parent.style.minHeight = `${minH}px`;
+  parent.style.overflow = "visible";
+
+  // Título exibido pode ser personalizado pelo usuário; a CHAVE de layout usa sempre o título original
+  // (dataset.freeOrigTitle), para que renomear nunca perca posição/tamanho salvos.
+  const titleNodeFor = card => [
+    card.querySelector(":scope > header h2"), card.querySelector(":scope > h2"),
+    card.querySelector(":scope > h3"), card.querySelector(":scope > .label"),
+    card.querySelector(":scope > span"), card.querySelector("h2"), card.querySelector("h3"),
+    card.querySelector(".label")
+  ].find(n => n && n.textContent.trim());
+  const titleFor = card => card.dataset.freeOrigTitle ||
+    (titleNodeFor(card)?.textContent || card.className || "card").trim().replace(/\s+/g, " ").slice(0, 140);
+  const nameStore = `painel-card-names:${storageName}`;
+  const readNames = () => { try { return JSON.parse(localStorage.getItem(nameStore) || "{}") || {}; } catch { return {}; } };
+  const writeName = (key, value) => {
+    const names = readNames(); if (value) names[key] = value; else delete names[key];
+    try { localStorage.setItem(nameStore, JSON.stringify(names)); } catch {}
+  };
+  const applyCustomName = (card, key) => {
+    const name = readNames()[key], node = titleNodeFor(card);
+    if (!name || !node) return;
+    if (!card.dataset.freeOrigTitle) card.dataset.freeOrigTitle = titleFor(card);
+    node.textContent = name;
+  };
+  // Edição inline do nome: Enter/clique fora salva, Esc cancela, vazio restaura o nome original.
+  const startRename = card => {
+    const node = titleNodeFor(card);
+    if (!node || node.querySelector("input")) return;
+    const key = card.dataset.freeCardKey, shown = node.textContent.trim(), orig = card.dataset.freeOrigTitle || shown;
+    const input = document.createElement("input");
+    input.type = "text"; input.className = "free-card-name-input"; input.value = shown; input.maxLength = 60;
+    input.setAttribute("aria-label", "Nome do card (deixe vazio para restaurar o original)");
+    node.textContent = ""; node.appendChild(input); input.focus(); input.select();
+    let finished = false;
+    const finish = save => {
+      if (finished) return; finished = true;
+      const value = input.value.trim().replace(/\s+/g, " ");
+      if (!save) { node.textContent = shown; return; }
+      if (!value || value === orig) { writeName(key, ""); delete card.dataset.freeOrigTitle; node.textContent = orig; }
+      else { writeName(key, value); card.dataset.freeOrigTitle = orig; node.textContent = value; }
+    };
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); finish(true); } else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+      e.stopPropagation();
+    });
+    input.addEventListener("blur", () => finish(true));
+  };
+  const keyFor = card => `${[...card.classList].filter(c => !["online", "offline", "unknown", "moving", "free-card-moving"].includes(c)).sort().join(".")}:${titleFor(card)}`;
+  const widthFor = card => {
+    if (typeof options.widthFor === "function") return Math.max(minW(), Math.min(available, options.widthFor(card, available)));
+    if (card.classList.contains("stat")) return Math.min(210, Math.max(150, (available - gap * 3) / 4));
+    if (card.classList.contains("switch")) return Math.max(420, Math.min(960, available - 28));
+    if (card.classList.contains("rank")) return Math.max(300, Math.min(450, (available - gap) / 2));
+    return Math.max(minW(), Math.min(360, available - gap));
+  };
+  const heightFor = card => {
+    if (typeof options.heightFor === "function") return options.heightFor(card);
+    if (card.classList.contains("stat")) return 86;
+    if (card.classList.contains("switch")) return 175;
+    if (card.classList.contains("rank")) return 220;
+    if (card.classList.contains("card")) return 175;
+    return 230;
+  };
+  const items = visibleCards.map((card, i) => {
+    const key = keyFor(card);
+    card.dataset.freeCardKey = key;
+    applyCustomName(card, key);
+    const record = saved[key] && Number.isFinite(Number(saved[key].x)) ? saved[key] : null;
+    card.style.position = "absolute";
+    card.style.boxSizing = "border-box";
+    card.style.margin = "0";
+    card.style.maxWidth = "none";
+    card.style.maxHeight = "none";
+    card.style.minWidth = `${minW()}px`;
+    card.style.minHeight = `${minH}px`;
+    card.classList.add("free-card-managed");
+    card.style.resize = isPanelLayoutEditing() ? "both" : "none";
+    card.style.overflow = "auto";
+    card.style.touchAction = "auto";
+    card.style.width = `${Math.max(minW(), Number(record?.w) || widthFor(card))}px`;
+    card.style.height = record?.h ? `${Math.max(minH, Number(record.h))}px` : "auto";
+    card.style.left = `${Math.max(0, Number(record?.x) || 0)}px`;
+    card.style.top = `${Math.max(0, Number(record?.y) || 0)}px`;
+    card.style.zIndex = String(Number(record?.z) || (100 + i));
+    card.style.cursor = "default";
+    return { card, key, record, index: i };
+  });
+
+  const anySaved = items.some(x => x.record);
+  if (!anySaved) {
+    let x = 0, y = 0, rowHeight = 0;
+    for (const item of items) {
+      const w = widthFor(item.card);
+      item.card.style.width = `${w}px`;
+      item.card.style.height = "auto";
+      if (x > 0 && x + w > available) { x = 0; y += rowHeight + gap; rowHeight = 0; }
+      item.card.style.left = `${x}px`; item.card.style.top = `${y}px`;
+      const h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+      item.card.style.height = `${h}px`;
+      item.record = { x, y, w, h, z: 100 + item.index };
+      rowHeight = Math.max(rowHeight, h); x += w + gap;
+    }
+  } else {
+    let bottom = 0;
+    for (const item of items) if (item.record) bottom = Math.max(bottom, Number(item.record.y || 0) + Number(item.record.h || item.card.offsetHeight || minH));
+    for (const item of items) {
+      if (!item.record) {
+        const w = widthFor(item.card), h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+        item.record = { x: 0, y: bottom + gap, w, h, z: 100 + item.index };
+        item.card.style.left = "0px"; item.card.style.top = `${item.record.y}px`;
+        item.card.style.width = `${w}px`; item.card.style.height = `${h}px`;
+        bottom += h + gap;
+      } else if (!item.record.h) {
+        item.record.h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+        item.card.style.height = `${item.record.h}px`;
+      }
+    }
+  }
+
+  // Anti-sobreposição (estilo Sortable): ao arrastar/redimensionar, os outros cards abrem espaço (empurrados para
+  // baixo a partir da posição que tinham no início do gesto); ao soltar, o layout é compactado e preenche os vazios.
+  const rectOf = card => ({ x: parseFloat(card.style.left) || 0, y: parseFloat(card.style.top) || 0, w: card.offsetWidth, h: card.offsetHeight });
+  const snapshot = () => items.filter(i => i.card.style.display !== "none").map(i => ({ card: i.card, ...rectOf(i.card) }));
+  let dragBase = null, resizeBase = null, ghost = null;
+  const reflow = (moving, base) => {
+    const others = base.filter(b => b.card !== moving);
+    const pos = PanelNoOverlap.push(rectOf(moving), others);
+    others.forEach((o, i) => { o.card.style.left = `${pos[i].x}px`; o.card.style.top = `${pos[i].y}px`; });
+    // Espaço-fantasma: onde o card vai assentar quando for solto (após compactar).
+    const mine = rectOf(moving);
+    const dest = PanelNoOverlap.compact([mine, ...others.map((o, i) => ({ x: pos[i].x, y: pos[i].y, w: o.w, h: o.h }))])[0];
+    if (!ghost) { ghost = document.createElement("div"); ghost.className = "free-drop-ghost"; parent.appendChild(ghost); }
+    Object.assign(ghost.style, { left: `${dest.x}px`, top: `${dest.y}px`, width: `${mine.w}px`, height: `${mine.h}px` });
+    resizeCanvas();
+  };
+  const settle = () => {
+    if (window.PanelNoOverlap) {
+      const list = snapshot(), pos = PanelNoOverlap.compact(list);
+      list.forEach((o, i) => { o.card.style.left = `${pos[i].x}px`; o.card.style.top = `${pos[i].y}px`; });
+    }
+    dragBase = null; resizeBase = null; parent.classList.remove("free-reflowing");
+    if (ghost) { ghost.remove(); ghost = null; }
+    resizeCanvas();
+  };
+  // Assistente: após redimensionar um card, sugere padronizar o grupo (mesmo tamanho ou N por linha, alinhado). Com Desfazer.
+  const suggestLayout = card => {
+    if (!window.PanelUX?.suggestLayout || !window.PanelNoOverlap) return;
+    const count = snapshot().length;
+    if (count < 2) return;
+    const size = { w: Math.round(card.offsetWidth), h: Math.round(card.offsetHeight) };
+    const width = parent.clientWidth || available;
+    const cwFor = n => Math.floor((width - gap * (n - 1)) / n);
+    const minKey = `painel-card-minw:${storageName}`;
+    const apply = (build, undoExtra) => {
+      const list = snapshot();
+      const prev = list.map(o => ({ card: o.card, left: o.card.style.left, top: o.card.style.top, width: o.card.style.width, height: o.card.style.height }));
+      build(list).forEach((r, i) => {
+        const el = list[i].card;
+        el.style.left = `${r.x}px`; el.style.top = `${r.y}px`; el.style.width = `${r.w}px`; el.style.height = `${r.h}px`;
+      });
+      settle(); persist(); resizeCanvas();
+      PanelUX.toast(`Layout aplicado a ${count} cards`, { action: "Desfazer", onAction: () => {
+        if (undoExtra) undoExtra();
+        prev.forEach(p => Object.assign(p.card.style, { left: p.left, top: p.top, width: p.width, height: p.height }));
+        settle(); persist(); resizeCanvas();
+      } });
+    };
+    PanelUX.suggestLayout({
+      count, sizeLabel: `${size.w}×${size.h}`,
+      maxPerRow: count,
+      tightFrom: (() => { for (let n = 1; n <= count; n++) if (cwFor(n) < baseMinW) return n; return Infinity; })(),
+      minOk: n => cwFor(n) >= 80,
+      onSameSize: () => apply(list => {
+        const sized = list.map(o => ({ x: o.x, y: o.y, w: size.w, h: size.h }));
+        const pos = PanelNoOverlap.flow(sized, width);
+        return sized.map((o, i) => ({ x: pos[i].x, y: pos[i].y, w: size.w, h: size.h }));
+      }),
+      onGrid: n => {
+        // Se a coluna ficar mais estreita que o mínimo padrão, reduz o mínimo do grupo (e guarda) para o layout não sobrepor.
+        const prevMin = parent._freeMinW || 0, setMin = v => {
+          parent._freeMinW = v;
+          try { v ? localStorage.setItem(minKey, String(v)) : localStorage.removeItem(minKey); } catch {}
+          snapshot().forEach(o => { o.card.style.minWidth = `${minW()}px`; });
+        };
+        setMin(cwFor(n) < baseMinW ? cwFor(n) : 0);
+        apply(list => PanelNoOverlap.gridLayout(list, n, width, gap), () => setMin(prevMin));
+      }
+    });
+  };
+  if (window.PanelNoOverlap) {
+    // Layout salvo/inicial com cards sobrepostos é reorganizado ao abrir (empurra para baixo).
+    const placed = [];
+    [...items].sort((a, b) => rectOf(a.card).y - rectOf(b.card).y || rectOf(a.card).x - rectOf(b.card).x).forEach(({ card }) => {
+      const r = rectOf(card), f = PanelNoOverlap.resolve(r, placed, available);
+      card.style.left = `${f.x}px`; card.style.top = `${f.y}px`;
+      placed.push({ x: f.x, y: f.y, w: r.w, h: r.h });
+    });
+  }
+  let maxZ = Math.max(100, ...items.map(x => Number(x.record?.z) || 100));
+  const persist = () => {
+    const out = {};
+    for (const { card, key } of items) out[key] = {
+      x: Math.max(0, Math.round(parseFloat(card.style.left) || 0)),
+      y: Math.max(0, Math.round(parseFloat(card.style.top) || 0)),
+      w: Math.max(minW(), Math.round(card.offsetWidth)),
+      h: Math.max(minH, Math.round(card.offsetHeight)),
+      z: Number(card.style.zIndex) || 100
+    };
+    try { localStorage.setItem(`painel-free-cards:${storageName}`, JSON.stringify({ ...saved, ...out })); } catch {}
+  };
+  if (parent._freeCardLayoutContext) parent._freeCardLayoutContext.persist = persist;
+  const resizeCanvas = () => {
+    let bottom = 0;
+    for (const {card} of items) bottom = Math.max(bottom, (parseFloat(card.style.top) || 0) + card.offsetHeight);
+    parent.style.height = `${Math.max(minH, bottom + gap)}px`;
+  };
+  const guides = ensureFreeAlignmentGuides(parent);
+  const hideGuides = () => { guides.vertical.style.display = "none"; guides.horizontal.style.display = "none"; };
+  if (parent._freeCardLayoutContext) { parent._freeCardLayoutContext.items = items; parent._freeCardLayoutContext.hideGuides = hideGuides; parent._freeCardLayoutContext.resizeCanvas = resizeCanvas; }
+  const nearestSnap = (position, size, targets) => {
+    const points = [position, position + size / 2, position + size];
+    let best = null;
+    for (const point of points) for (const target of targets) {
+      const delta = target - point, distance = Math.abs(delta);
+      if (distance <= 8 && (!best || distance < best.distance)) best = { delta, target, distance };
+    }
+    return best;
+  };
+  const snapFreePosition = (card, left, top) => {
+    const others = items.filter(item => item.card !== card).map(({card: other}) => ({
+      x: parseFloat(other.style.left) || 0, y: parseFloat(other.style.top) || 0,
+      w: other.offsetWidth, h: other.offsetHeight
+    }));
+    const xTargets = others.flatMap(o => [o.x, o.x + o.w / 2, o.x + o.w]);
+    const yTargets = others.flatMap(o => [o.y, o.y + o.h / 2, o.y + o.h]);
+    const sx = nearestSnap(left, card.offsetWidth, xTargets);
+    const sy = nearestSnap(top, card.offsetHeight, yTargets);
+    if (sx) { left += sx.delta; guides.vertical.style.left = `${sx.target}px`; guides.vertical.style.display = "block"; }
+    else guides.vertical.style.display = "none";
+    if (sy) { top += sy.delta; guides.horizontal.style.top = `${sy.target}px`; guides.horizontal.style.display = "block"; }
+    else guides.horizontal.style.display = "none";
+    return { x: Math.max(0, left), y: Math.max(0, top) };
+  };
+  const snapFreeSize = card => {
+    if (!isPanelLayoutEditing() || card.dataset.freeResizing !== "1") return;
+    const left = parseFloat(card.style.left) || 0, top = parseFloat(card.style.top) || 0;
+    const others = items.filter(item => item.card !== card).map(({card: other}) => ({
+      x: parseFloat(other.style.left) || 0, y: parseFloat(other.style.top) || 0,
+      w: other.offsetWidth, h: other.offsetHeight
+    }));
+    const xTargets = others.flatMap(o => [o.x, o.x + o.w / 2, o.x + o.w]);
+    const yTargets = others.flatMap(o => [o.y, o.y + o.h / 2, o.y + o.h]);
+    const snapEdge = (edge, targets, origin, minSize) => {
+      let best = null;
+      for (const target of targets) { const d = Math.abs(target - edge); if (d <= 8 && target - origin >= minSize && (!best || d < best.distance)) best = { target, distance: d }; }
+      return best;
+    };
+    const sx = snapEdge(left + card.offsetWidth, xTargets, left, minW());
+    const sy = snapEdge(top + card.offsetHeight, yTargets, top, minH);
+    if (sx) { const w = sx.target - left; if (Math.abs(card.offsetWidth - w) > 1) card.style.width = `${w}px`; guides.vertical.style.left = `${sx.target}px`; guides.vertical.style.display = "block"; }
+    else guides.vertical.style.display = "none";
+    if (sy) { const h = sy.target - top; if (Math.abs(card.offsetHeight - h) > 1) card.style.height = `${h}px`; guides.horizontal.style.top = `${sy.target}px`; guides.horizontal.style.display = "block"; }
+    else guides.horizontal.style.display = "none";
+  };
+  parent._freeCardLayoutContext = { items, persist, resizeCanvas, hideGuides, settle, suggest: suggestLayout };
+  if (!parent.dataset.freeLayoutPointerUpBound) {
+    parent.dataset.freeLayoutPointerUpBound = "1";
+    const finishResize = () => {
+      const ctx = parent._freeCardLayoutContext;
+      if (!ctx) return;
+      let changed = false, resized = null;
+      for (const {card} of ctx.items) if (card.dataset.freeResizing === "1") {
+        delete card.dataset.freeResizing; changed = true;
+        const s0 = card._startSize;
+        if (s0 && (Math.abs(s0.w - card.offsetWidth) > 2 || Math.abs(s0.h - card.offsetHeight) > 2)) resized = card;
+      }
+      if (changed) {
+        ctx.hideGuides(); if (ctx.settle) ctx.settle(); if (ctx.persist) ctx.persist(); ctx.resizeCanvas();
+        if (resized && ctx.suggest) ctx.suggest(resized);
+      }
+    };
+    document.addEventListener("pointerup", finishResize);
+    document.addEventListener("pointercancel", finishResize);
+  }
+  for (const { card, key } of items) {
+    if (!card.querySelector(".free-card-grip")) {
+      const grip = document.createElement("button");
+      grip.type = "button"; grip.className = "free-card-grip"; grip.textContent = "⠿";
+      grip.title = "Arrastar cartão"; grip.setAttribute("aria-label", `Mover ${titleFor(card)}`);
+      card.appendChild(grip);
+    }
+    if (!card.querySelector(".free-card-delete")) {
+      const removeButton = document.createElement("button");
+      removeButton.type = "button";
+      removeButton.className = "free-card-delete";
+      removeButton.textContent = "×";
+      removeButton.title = `Excluir card: ${titleFor(card)}`;
+      removeButton.setAttribute("aria-label", `Excluir card ${titleFor(card)}`);
+      card.appendChild(removeButton);
+      removeButton.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        if (!isPanelLayoutEditing()) return;
+        const title = (titleNodeFor(card)?.textContent || titleFor(card)).trim();
+        if (!window.PanelUX && !window.confirm(`Excluir o card "${title}" deste painel? Você poderá restaurá-lo pelo botão Restaurar cards excluídos.`)) return;
+        const store = `painel-hidden-cards:${storageName}`;
+        const readHidden = () => { try { return JSON.parse(localStorage.getItem(store) || "[]") || []; } catch { return []; } };
+        const hidden = readHidden();
+        if (!hidden.includes(key)) hidden.push(key);
+        localStorage.setItem(store, JSON.stringify(hidden));
+        card.style.display = "none";
+        settle(); persist(); resizeCanvas();   // os demais sobem e fecham o vazio
+        if (window.PanelUX) PanelUX.toast(`Card "${title}" excluído`, { action: "Desfazer", onAction: () => {
+          localStorage.setItem(store, JSON.stringify(readHidden().filter(k => k !== key)));
+          card.style.display = "";
+          if (window.PanelNoOverlap) reflow(card, snapshot());   // devolve o card e abre espaço
+          settle(); persist(); resizeCanvas();
+        } });
+      });
+    }
+    if (!card.querySelector(".free-card-rename")) {
+      const renameButton = document.createElement("button");
+      renameButton.type = "button"; renameButton.className = "free-card-rename"; renameButton.textContent = "✎";
+      renameButton.title = `Renomear card: ${titleFor(card)}`;
+      renameButton.setAttribute("aria-label", `Renomear card ${titleFor(card)}`);
+      card.appendChild(renameButton);
+      renameButton.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); if (isPanelLayoutEditing()) startRename(card); });
+    }
+    const nameNode = titleNodeFor(card);
+    if (nameNode && !nameNode.dataset.renameBound) {
+      nameNode.dataset.renameBound = "1";
+      nameNode.addEventListener("dblclick", e => { if (isPanelLayoutEditing() && !e.target.closest("input")) { e.preventDefault(); startRename(card); } });
+    }
+    let tools = card.querySelector(":scope > .free-card-tools");
+    if (!tools) { tools = document.createElement("div"); tools.className = "free-card-tools"; card.appendChild(tools); }
+    for (const cls of [".free-card-rename", ".free-card-grip", ".free-card-delete"]) {
+      const control = card.querySelector(cls);
+      if (control && control.parentElement !== tools) tools.appendChild(control);
+    }
+    const dragHandles = [card.querySelector(".free-card-grip"), card.querySelector(":scope > header"), card.querySelector(":scope > h3"), card.querySelector(":scope > .label")].filter(Boolean);
+    if (!card.dataset.freeDragBound) {
+      card.dataset.freeDragBound = "1";
+      for (const handle of dragHandles) {
+        handle.style.cursor = isPanelLayoutEditing() ? "grab" : "default";
+        handle.style.userSelect = "none";
+        handle.addEventListener("pointerdown", e => {
+          if (!isPanelLayoutEditing() || e.button !== 0 || e.target.closest("input,select,textarea,a,button:not(.free-card-grip)")) return;
+          const start = { x: e.clientX, y: e.clientY, left: parseFloat(card.style.left) || 0, top: parseFloat(card.style.top) || 0, pointerId: e.pointerId };
+          card.style.zIndex = String(++maxZ); card.classList.add("free-card-moving");
+          if (window.PanelNoOverlap) { dragBase = snapshot(); parent.classList.add("free-reflowing"); }
+          e.preventDefault();
+          const move = ev => {
+            if (ev.pointerId !== start.pointerId) return;
+            const snapped = snapFreePosition(card, Math.max(0, start.left + ev.clientX - start.x), Math.max(0, start.top + ev.clientY - start.y));
+            card.style.left = `${snapped.x}px`;
+            card.style.top = `${snapped.y}px`;
+            if (window.PanelNoOverlap && dragBase) reflow(card, dragBase);
+            resizeCanvas();
+          };
+          const finish = ev => {
+            if (ev.pointerId !== start.pointerId) return;
+            document.removeEventListener("pointermove", move);
+            document.removeEventListener("pointerup", finish);
+            document.removeEventListener("pointercancel", finish);
+            card.classList.remove("free-card-moving");
+            settle();
+            hideGuides(); persist(); resizeCanvas();
+          };
+          document.addEventListener("pointermove", move);
+          document.addEventListener("pointerup", finish);
+          document.addEventListener("pointercancel", finish);
+        });
+      }
+    }
+    if (!card.dataset.freeResizeDetectBound) {
+      card.dataset.freeResizeDetectBound = "1";
+      card.addEventListener("pointerdown", e => {
+        if (!isPanelLayoutEditing()) return;
+        const rect = card.getBoundingClientRect();
+        if (e.clientX >= rect.right - 22 && e.clientY >= rect.bottom - 22) { card.dataset.freeResizing = "1"; card._startSize = { w: card.offsetWidth, h: card.offsetHeight }; if (window.PanelNoOverlap) { resizeBase = snapshot(); parent.classList.add("free-reflowing"); } }
+      });
+    }
+    if (!card._freeCardResizeObserver && typeof ResizeObserver !== "undefined") {
+      card._freeCardResizeObserver = new ResizeObserver(() => {
+        if (!card.isConnected) return;
+        snapFreeSize(card);
+        if (window.PanelNoOverlap && isPanelLayoutEditing() && resizeBase && card.dataset.freeResizing === "1") reflow(card, resizeBase);
+        resizeCanvas();
+        clearTimeout(card._freeSaveTimer);
+        card._freeSaveTimer = setTimeout(persist, 150);
+      });
+      card._freeCardResizeObserver.observe(card);
+    }
+  }
+  resizeCanvas();
+  persist();
+}
+
+async function refresh() {
+  if (isPanelLayoutEditing()) return;
+  const revision = panelDataRevision;
+  const banner = document.getElementById("banner");
+  try {
+    const res = await fetch("/api/network");
+    if (isPanelLayoutEditing() || revision !== panelDataRevision) return;
+    if (!res.ok) throw new Error((await res.json()).detail || res.status);
+    const freshData = await res.json();
+    if (isPanelLayoutEditing() || revision !== panelDataRevision) return;
+    data = freshData;
+    lastOk = new Date(data.updated);
+    banner.hidden = !data.mock;
+    if (data.mock) banner.textContent = "Dados de demonstração. Defina ZABBIX_URL e ZABBIX_TOKEN para ver os equipamentos reais.";
+    document.getElementById("updated").textContent = "Atualizado às " + lastOk.toLocaleTimeString("pt-BR");
+    render();
+  } catch (err) {
+    if (isPanelLayoutEditing() || revision !== panelDataRevision) return;
+    banner.hidden = false;
+    banner.textContent = `${err.message || err}. ` + (lastOk ? `Mostrando os dados das ${lastOk.toLocaleTimeString("pt-BR")}.` : "");
+  }
+}
+
+document.getElementById("q").addEventListener("input", e => { query = e.target.value; if (data) renderTable(); });
+document.getElementById("f").addEventListener("change", e => { statusFilter = e.target.value; if (data) renderTable(); });
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

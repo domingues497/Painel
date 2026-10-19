@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="color-scheme" content="dark"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conexão com o Zabbix</title><link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;600&family=Barlow+Condensed:wght@500;600&display=swap">
+<link rel="stylesheet" href="/static/ui.css">
+<style>
+main>.card,main>p,.lead{max-width:850px;margin-left:auto;margin-right:auto}
+.card{margin-top:22px;padding:24px}.status{display:none}.top h1{margin:0}
+</style></head><body><main>
+<div class="top"><h1>Conexão com o Zabbix</h1><nav class="nav" aria-label="Painéis"><a href="/">Switches</a><a href="/hosts.html?view=servers">Servidores</a><a href="/hosts.html?view=workstations">Computadores</a><a href="/hosts.html?view=all">Todos os hosts</a><a href="/rede.html">Rede</a><a href="/executivo.html">Executivo</a><a href="/configuracao.html" aria-current="page">Configuração</a></nav></div>
+<p class="lead">Configure e teste a conexão com a API antes de salvar.</p>
+<section class="card"><form id="form"><div class="grid">
+<div class="full"><label for="url">URL da API</label><input id="url" type="url" required placeholder="http://172.24.100.160/zabbix/api_jsonrpc.php"><div class="help">Informe o endpoint JSON-RPC completo.</div></div>
+<div class="full"><label for="auth_type">Tipo de autenticação</label><select id="auth_type"><option value="token">Token de API (recomendado)</option><option value="password">Usuário e senha</option></select></div>
+<div class="full" id="token_row"><label for="token">Token da API</label><input id="token" type="password" autocomplete="new-password" placeholder="Cole o token do Zabbix"></div>
+<div class="full" id="username_row" hidden><label for="username">Usuário</label><input id="username" autocomplete="username" placeholder="Usuário do Zabbix"></div>
+<div class="full" id="password_row" hidden><label for="password">Senha</label><input id="password" type="password" autocomplete="current-password" placeholder="Senha do Zabbix"></div>
+<div class="full"><label class="check"><input id="verify_tls" type="checkbox" checked> Validar certificado TLS/SSL</label><div class="help">Recomendado em produção.</div></div>
+</div><div class="actions"><button type="button" id="test" class="primary">Testar conexão</button><button type="submit">Testar e salvar</button></div><div id="status" class="status" role="status"></div></form></section>
+<p class="help">As credenciais são gravadas no arquivo local .env. Proteja esse arquivo e não exponha esta tela publicamente sem autenticação administrativa.</p></main>
+<script>
+const $=id=>document.getElementById(id);
+function updateAuth(){const token=$('auth_type').value==='token';$('token_row').hidden=!token;$('username_row').hidden=token;$('password_row').hidden=token;$('token').required=token;$('username').required=!token;$('password').required=!token}
+$('auth_type').addEventListener('change',updateAuth);updateAuth();
+function payload(){return {url:$('url').value.trim(),auth_type:$('auth_type').value,token:$('token').value,username:$('username').value,password:$('password').value,verify_tls:$('verify_tls').checked}}
+function show(msg,ok){$('status').className='status '+(ok?'ok':'bad');$('status').textContent=msg}
+async function send(path){const b=path.endsWith('/test')?$('test'):$('form').querySelector('button[type=submit]');b.disabled=true;try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});const d=await r.json();if(!r.ok)throw Error(d.detail||'Falha inesperada');show(path.endsWith('/test')?'Conexão realizada. Versão do Zabbix: '+d.version+'.':d.message,true);if(path.endsWith('/save')){$('token').value='';$('password').value=''}}catch(e){show(e.message,false)}finally{b.disabled=false}}
+$('test').onclick=()=>send('/api/settings/test');$('form').onsubmit=e=>{e.preventDefault();send('/api/settings/save')};
+fetch('/api/settings').then(r=>r.json()).then(c=>{if(c.url)$('url').value=c.url;if(c.auth_type)$('auth_type').value=c.auth_type;if(c.username)$('username').value=c.username;$('verify_tls').checked=!!c.verify_tls;updateAuth()}).catch(()=>{});
+</script></body></html>

@@ -1,0 +1,1462 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hosts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;600&family=Barlow+Condensed:wght@500;600&display=swap">
+<link rel="stylesheet" href="/static/ui.css">
+<style>
+:root{--row-label:70px}
+.stats{position:relative;display:block;width:100%;min-height:100px;margin-bottom:18px}
+.ranks{position:relative;display:block;width:100%;min-height:340px;margin:0 0 18px;overflow:visible}
+.rank{position:absolute;display:block;min-width:var(--rank-min,240px);min-height:160px;max-width:100%;max-height:none;resize:both;overflow:auto}
+.rank.moving{opacity:.9;outline:2px solid var(--accent);box-shadow:0 10px 28px #0006}
+.cards{position:relative;display:block;width:100%;min-height:220px}
+table{min-width:900px}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1 id="title">Servidores</h1>
+  <nav class="nav" aria-label="Painéis">
+    <a href="/">Switches</a>
+    <a href="/hosts.html?view=servers" data-view="servers">Servidores</a>
+    <a href="/hosts.html?view=workstations" data-view="workstations">Computadores</a>
+    <a href="/hosts.html?view=all" data-view="all">Todos os hosts</a>
+    <a href="/rede.html">Rede</a>
+    <a href="/executivo.html">Executivo</a>
+  </nav>
+  <div class="layout-actions"><span class="updated" id="updated"></span><button class="layout-edit-toggle" id="layout-edit-toggle" type="button" aria-pressed="false">Editar painel</button></div>
+</div>
+<p class="banner" id="banner" hidden></p>
+<section class="stats" id="stats" aria-label="Resumo"></section>
+<section class="ranks" id="ranks" aria-label="Rankings"></section>
+<div class="tools" id="tools" hidden>
+  <label>Buscar <input id="q" type="search" placeholder="Nome do host"></label>
+  <label>Mostrar
+    <select id="f">
+      <option value="all">Todos</option>
+      <option value="online">Online</option>
+      <option value="offline">Sem resposta</option>
+      <option value="problems">Com problemas</option>
+      <option value="collection">Coleta com falha</option>
+    </select>
+  </label>
+</div>
+<main id="content" aria-live="polite"></main>
+<p class="foot">Limites das barras: CPU e memória 80% (atenção) e 90% (crítico); disco 85% e 95%. O alerta com persistência (por exemplo, acima de 90% por 10 min) é avaliado pelas triggers do Zabbix e aparece em "Problemas". Valores ausentes aparecem como "–", nunca como zero.</p>
+
+<script src="/static/no-overlap.js"></script>
+<script src="/static/edit-ux.js"></script>
+<script src="/static/rank-calc.js"></script>
+<script>
+const REFRESH_MS = 20000;
+// Limites iniciais do documento de KPIs: [atenção, crítico] em % de uso.
+const THRESH = { cpu: [80, 90], mem: [80, 90], disk: [85, 95] };
+const SEV = ["Sem classificação", "Informação", "Aviso", "Média", "Alta", "Desastre"];
+const STATUS = { online: "Online", offline: "Sem resposta", unknown: "Sem dados" };
+const STATUS_W = { offline: 0, unknown: 1, online: 2 };
+const KIND = { server: "Servidor", workstation: "Computador", other: "Outro" };
+const VIEWS = {
+  servers: { kind: "server", title: "Servidores", cards: true, nameLabel: "Servidor" },
+  workstations: { kind: "workstation", title: "Computadores de usuários", cards: false, nameLabel: "Computador" },
+  all: { kind: "all", title: "Todos os hosts", cards: false, nameLabel: "Host" },
+};
+const requested = new URLSearchParams(location.search).get("view");
+const viewKey = VIEWS[requested] ? requested : "servers";
+const VIEW = VIEWS[viewKey];
+
+let hosts = [], lastOk = null, query = "", statusFilter = "all", sort = { key: "name", dir: 1 };
+let availHours = 24, staleSeconds = 900;
+const defaultSeverities = [2, 3, 4, 5];
+let visibleSeverities = (() => { try { return JSON.parse(localStorage.getItem("painel-card-severities") || "null") || defaultSeverities.slice(); } catch { return defaultSeverities.slice(); } })();
+
+const h = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "style") e.style.cssText = v; else e.setAttribute(k, v);
+  }
+  e.append(...kids.filter(k => k !== null && k !== undefined));
+  return e;
+};
+const fmt = (n, d = 0) => n.toLocaleString("pt-BR", { maximumFractionDigits: d, minimumFractionDigits: d });
+const level = (v, key) => { const [warn, crit] = THRESH[key]; return v >= crit ? "crit" : v >= warn ? "warn" : "ok"; };
+
+function fmtUptime(s) {
+  if (s === null || s === undefined) return "–";
+  const d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `${d} d ${hh} h`;
+  if (hh) return `${hh} h ${m} min`;
+  return `${m} min`;
+}
+function fmtAge(s) {
+  const m = Math.round(s / 60);
+  return m < 90 ? `há ${m} min` : `há ${Math.round(m / 60)} h`;
+}
+
+function meter(v, label, key) {
+  if (v === null || v === undefined) return h("span", { class: "na" }, "–");
+  const pct = Math.max(0, Math.min(100, v));
+  return h("span", { class: "meter-wrap" },
+    h("span", { class: `meter ${level(pct, key)}`, role: "meter", "aria-label": label, "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": Math.round(pct) },
+      h("i", { style: `width:${pct}%` })),
+    h("span", { class: "val" }, `${fmt(pct)}%`));
+}
+
+function problemChip(host) {
+  const p = host.problems;
+  if (!p.count) return h("span", { class: "chip none" }, "Nenhum");
+  const title = p.top.map(t => `${SEV[t.severity]}: ${t.name}`).join("\n");
+  return h("span", { class: `chip sev-${p.max}`, title }, `${p.count} ${p.count === 1 ? "problema" : "problemas"}`);
+}
+
+function statusBadge(host) {
+  return h("span", { class: `status ${host.status}` }, h("span", { class: "dot" }), STATUS[host.status]);
+}
+
+/* Saúde da coleta: dado ausente, antigo ou item não suportado nunca vira "tudo bem". */
+const isStale = s => s.status === "online" && s.age !== null && s.age > staleSeconds;
+function collectionIssues(s) {
+  const out = [];
+  if (s.status === "unknown") out.push("Sem dados de disponibilidade");
+  if (isStale(s)) out.push(`Dados antigos (${fmtAge(s.age)})`);
+  if (s.unsupported) out.push(`${s.unsupported} ${s.unsupported === 1 ? "item não suportado" : "itens não suportados"}`);
+  return out;
+}
+function collectionCell(s) {
+  const issues = collectionIssues(s);
+  if (!issues.length) return h("span", { class: "na" }, "OK");
+  return h("span", { class: "chip sev-2", title: issues.join("\n") }, issues[0] + (issues.length > 1 ? ` (+${issues.length - 1})` : ""));
+}
+
+/* ---------- Resumo ---------- */
+function renderStats(list) {
+  const count = f => list.filter(f).length;
+  const online = count(x => x.status === "online");
+  const withAvail = list.filter(x => x.availability !== null && x.availability !== undefined);
+  const avgAvail = withAvail.length ? withAvail.reduce((a, x) => a + x.availability, 0) / withAvail.length : null;
+  const unsupported = list.reduce((a, x) => a + (x.unsupported || 0), 0);
+  const items = [
+    ["online", String(online), "Online"],
+    ["offline", String(count(x => x.status === "offline")), "Sem resposta"],
+    ["", String(count(x => x.status === "unknown")), "Sem dados"],
+    ["online", list.length ? `${fmt((online / list.length) * 100, 1)}%` : "–", "Online agora"],
+    ["", avgAvail === null ? "–" : `${fmt(avgAvail, 1)}%`, `Disponibilidade ${availHours} h (ICMP)`],
+    ["problems", String(count(x => x.problems.count > 0)), "Com problemas"],
+    ["attention", String(count(x => x.icmp_loss !== null && x.icmp_loss > 0)), "Hosts com perda ICMP"],
+    ["attention", String(count(x => x.icmp_response_ms !== null && x.icmp_response_ms > 100)), "Latência ICMP > 100 ms"],
+    ["attention", String(count(isStale)), "Dados antigos"],
+    ["attention", String(unsupported), "Itens não suportados"],
+  ];
+  document.getElementById("stats").replaceChildren(
+    ...items.map(([cls, n, label]) => h("div", { class: `stat ${cls}` }, h("b", {}, n), h("span", {}, label))));
+  freeCardLayout("#stats", ".stat", `hosts-stats-${viewKey}`, { minWidth: 145, minHeight: 74 });
+}
+
+/* ---------- Rankings configuráveis (TOP 10) ---------- */
+const RANK_METRICS = {
+  cpu: { label: "Uso de CPU (%)", title: "TOP 10 — CPU", get: s => s.cpu, unit: "%", percent: true },
+  mem: { label: "Uso de memória (%)", title: "TOP 10 — Memória", get: s => s.mem, unit: "%", percent: true },
+  disk: { label: "Uso de disco (%)", title: "TOP 10 — Disco", get: s => s.disk?.worst, unit: "%", percent: true },
+  load: { label: "Carga média CPU", title: "TOP 10 — Carga CPU", get: s => s.load, unit: "", percent: false },
+  icmp_response_ms: { label: "Resposta ICMP (ms)", title: "TOP 10 — Resposta ICMP", get: s => s.icmp_response_ms, unit: " ms", percent: false },
+  icmp_loss: { label: "Perda ICMP (%)", title: "TOP 10 — Perda ICMP", get: s => s.icmp_loss, unit: "%", percent: true },
+  availability: { label: "Disponibilidade ICMP (%)", title: "TOP 10 — Disponibilidade", get: s => s.availability, unit: "%", percent: true },
+  uptime: { label: "Tempo ligado", title: "TOP 10 — Tempo ligado", get: s => s.uptime, unit: "", percent: false },
+  item_value: { label: "Valor do item monitorado", title: "TOP 10 — Item monitorado", get: () => null, unit: "", percent: false },
+};
+const RANK_DEFAULTS = [
+  { metric: "cpu", tag: "", tagValue: "" },
+  { metric: "mem", tag: "", tagValue: "" },
+  { metric: "disk", tag: "", tagValue: "", itemKey: "" },
+];
+let rankSettings = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem("painel-ranks-layout-v1") || "null");
+    if (Array.isArray(saved) && saved.length) return saved;
+  } catch {}
+  return RANK_DEFAULTS.map((x, i) => {
+    try { return { id: `rank-${i+1}`, width: 1, ...x, ...(JSON.parse(localStorage.getItem(`painel-rank-${i}`) || "{}")) }; }
+    catch { return { id: `rank-${i+1}`, width: 1, ...x }; }
+  });
+})();
+let rankIdCounter = rankSettings.reduce((max, x) => Math.max(max, Number(String(x.id || "").replace(/\D/g, "")) || 0), 0) + 1;
+let draggedRankId = null;
+
+function allHostTags(host) {
+  // As opções do TOP vêm das tags dos itens monitorados no Zabbix.
+  const itemTags = (host.item_tags || []).flatMap(item =>
+    (item.tags || []).map(t => ({
+      tag: String(t.tag || "").trim(),
+      value: String(t.value || "").trim(),
+      item: item.name || item.key || ""
+    }))
+  ).filter(t => t.tag);
+  if (itemTags.length) return itemTags;
+  // Fallback para ambientes que ainda tenham somente tags cadastradas no host.
+  if (Array.isArray(host.tags?.all) && host.tags.all.length) return host.tags.all;
+  return [];
+}
+function itemsForSelection(hostList, tag, tagValue) {
+  const byKey = new Map();
+  for (const host of hostList) {
+    for (const item of (host.item_tags || [])) {
+      if (tag && !(item.tags || []).some(t => String(t.tag || "").trim() === tag &&
+          (!tagValue || String(t.value || "").trim() === tagValue))) continue;
+      const key = String(item.key || item.name || "").trim();
+      if (key && !byKey.has(key)) byKey.set(key, { value: key, label: item.name || key });
+    }
+  }
+  return [...byKey.values()].sort((a, b) => a.label.localeCompare(b.label, "pt-BR"));
+}
+function wildcardMatch(pattern, candidate) {
+  const p = String(pattern || "").trim();
+  if (!p) return false;
+  // * funciona como curinga em qualquer posição: *texto, texto* ou *texto*.
+  const escaped = p.split("*").map(part => part.replace(/[\\^$+?.()|{}\[\]]/g, "\\$&")).join(".*");
+  try { return new RegExp(`^${escaped}$`, "i").test(String(candidate || "")); }
+  catch { return false; }
+}
+function itemHasSelectedTag(item, settings) {
+  if (!settings.tag) return true;
+  return (item.tags || []).some(t => String(t.tag || "").trim() === settings.tag &&
+    (!settings.tagValue || String(t.value || "").trim() === settings.tagValue));
+}
+function itemMatchesSelection(item, settings) {
+  if (!itemHasSelectedTag(item, settings)) return false;
+  const query = String(settings.itemKey || "").trim();
+  if (!query) return false;
+  const name = String(item.name || "");
+  const key = String(item.key || "");
+  const mode = settings.itemKeyMode || (query.includes("*") ? "pattern" : "exact");
+  if (mode === "exact") return key === query || (!key && name.toLowerCase() === query.toLowerCase());
+  if (query.includes("*")) return wildcardMatch(query, name) || wildcardMatch(query, key);
+  const q = query.toLocaleLowerCase("pt-BR");
+  return name.toLocaleLowerCase("pt-BR").includes(q) || key.toLocaleLowerCase("pt-BR").includes(q);
+}
+function itemSearchMatches(query, item) {
+  const q = String(query || "").trim();
+  if (!q) return false;
+  const name = String(item.label || "");
+  const key = String(item.value || "");
+  if (q.includes("*")) return wildcardMatch(q, name) || wildcardMatch(q, key);
+  const normalized = q.toLocaleLowerCase("pt-BR");
+  return name.toLocaleLowerCase("pt-BR").includes(normalized) || key.toLocaleLowerCase("pt-BR").includes(normalized);
+}
+function selectedItemValue(host, settings) {
+  if (!settings.itemKey) return null;
+  const candidates = (host.item_tags || []).filter(item => itemMatchesSelection(item, settings))
+    .map(item => {
+      const n = Number(item.lastvalue);
+      return Number.isFinite(n) && item.lastvalue !== "" ? { value: n, units: item.units || "", name: item.name || item.key || settings.itemKey } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.value - a.value || String(a.name).localeCompare(String(b.name), "pt-BR", { numeric: true, sensitivity: "base" }));
+  // Um host aparece uma única vez. Quando o padrão corresponde a vários itens
+  // (por exemplo, vários volumes de disco), usamos o maior valor numérico do host.
+  return candidates[0] || null;
+}
+// Conversão automática de unidades de grandeza (bytes/bits) para o sufixo mais legível.
+function autoUnit(value, units) {
+  const n = Number(value);
+  const u = String(units || "").trim();
+  if (!Number.isFinite(n)) return { value: n, units: u };
+  const scales = [
+    { re: /^(b|byte|bytes)$/i, base: 1024, names: ["B", "KB", "MB", "GB", "TB", "PB"] },
+    { re: /^(b\/s|byte\/s|bytes\/s|bps\/s)$/i, base: 1024, names: ["B/s", "KB/s", "MB/s", "GB/s", "TB/s", "PB/s"] },
+    { re: /^(bps|bit\/s|bits\/s)$/i, base: 1000, names: ["bps", "Kbps", "Mbps", "Gbps", "Tbps", "Pbps"] },
+  ];
+  const scale = scales.find(s => s.re.test(u));
+  if (!scale) return { value: n, units: u };
+  let v = Math.abs(n), i = 0;
+  while (v >= scale.base && i < scale.names.length - 1) { v /= scale.base; i += 1; }
+  return { value: Math.sign(n) * v, units: scale.names[i] };
+}
+// Aplica a transformação configurada no card (multiplicar, dividir, % do maior, unidade automática).
+function applyValueTransform(rows, settings) {
+  const t = settings.transform || {};
+  const op = t.op || "none";
+  if (op === "none" || !rows.length) return rows;
+  if (op === "percent") {
+    const max = Math.max(...rows.map(r => Math.abs(Number(r.value))).filter(Number.isFinite));
+    if (!Number.isFinite(max) || max <= 0) return rows.map(r => ({ ...r, raw: r.value, value: 0, units: "%" }));
+    return rows.map(r => ({ ...r, raw: r.value, value: (Number(r.value) / max) * 100, units: "%" }));
+  }
+  if (op === "auto_unit") return rows.map(r => {
+    const converted = autoUnit(r.value, r.units);
+    return { ...r, raw: r.value, value: converted.value, units: converted.units };
+  });
+  const factor = Number(t.factor);
+  if (!Number.isFinite(factor) || factor === 0) return rows;
+  const unitOverride = String(t.unit || "").trim();
+  return rows.map(r => {
+    const n = Number(r.value);
+    return { ...r, raw: r.value, value: op === "divide" ? n / factor : n * factor, units: unitOverride || r.units };
+  });
+}
+function selectControl(label, options, value, onChange) {
+  const select = h("select", { "aria-label": label });
+  for (const opt of options) select.appendChild(h("option", { value: opt.value }, opt.label));
+  select.value = value;
+  select.addEventListener("change", () => onChange(select.value));
+  return h("label", {}, label, select);
+}
+function rankList(hostList, settings) {
+  hostList = settings.group ? hostList.filter(host => (host.groups || []).includes(settings.group)) : hostList;
+  const metric = RANK_METRICS[settings.metric] || RANK_METRICS.cpu;
+  const filtered = hostList.filter(host => settings.metric === "item_value" || !settings.tag ||
+    allHostTags(host).some(t => t.tag === settings.tag && (!settings.tagValue || t.value === settings.tagValue)))
+    .map(host => {
+      if (settings.metric === "item_value") {
+        const item = selectedItemValue(host, settings);
+        return item ? { host, value: item.value, units: item.units, itemName: item.name } : null;
+      }
+      const value = metric.get(host);
+      return { host, value, units: metric.unit, itemName: "" };
+    })
+    .filter(row => row && typeof row.value === "number" && Number.isFinite(row.value))
+    .sort((a, b) => b.value - a.value);
+  // Linhas para o painel de cálculos (Σ): `all` = todos os hosts com dado; `top` = os 10 exibidos.
+  const rowsForCalc = { all: filtered, top: filtered.slice(0, 10), metric };
+  const shown = rowsForCalc.top;
+  if (!shown.length) {
+    const empty = h("p", { class: "na" }, settings.metric === "item_value" && !settings.itemKey
+      ? "Selecione um item monitorado para exibir seus valores."
+      : "Sem dados numéricos para esta combinação de tag e item.");
+    empty._rows = rowsForCalc;
+    return empty;
+  }
+  const transformed = applyValueTransform(shown, settings);
+  const rawUptime = settings.metric === "uptime" && (settings.transform?.op || "none") === "none";
+  const ol = h("ol", {});
+  for (const row of transformed) {
+    const display = rawUptime ? fmtUptime(row.value) : `${fmt(row.value, 2)}${row.units ? " " + row.units : metric.unit}`;
+    ol.appendChild(h("li", {}, h("span", { class: "rname", title: row.host.name }, row.host.name),
+      h("span", { class: "val", title: row.itemName || metric.label }, display)));
+  }
+  ol._rows = rowsForCalc;
+  return ol;
+}
+/* ---------- Painel de cálculos do TOP (botão Σ) ---------- */
+// Mostra soma, média, mediana, P95, máximo/mínimo (com o host), desvio padrão e amplitude, sobre o TOP 10 exibido
+// ou sobre todos os hosts com dado. O estado (aberto / base) fica guardado nas configurações do card.
+function rankCalcPanel(data, settings, index) {
+  const box = h("div", { class: "rank-calc", hidden: !settings.calcOpen });
+  const isUptime = settings.metric === "uptime";
+  const paint = () => {
+    box.replaceChildren();
+    const base = settings.calcBase === "all" ? "all" : "top";
+    const rows = data[base];
+    const seg = h("div", { class: "rank-calc-seg", role: "group", "aria-label": "Base do cálculo" });
+    for (const [key, label] of [["top", `TOP 10 exibidos (${data.top.length})`], ["all", `Todos com dado (${data.all.length})`]]) {
+      const b = h("button", { type: "button", "aria-pressed": String(base === key) }, label);
+      b.addEventListener("click", () => { settings.calcBase = key; saveRank(index); paint(); });
+      seg.appendChild(b);
+    }
+    box.appendChild(seg);
+    const st = window.RankCalc ? RankCalc.stats(rows.map(r => r.value)) : null;
+    if (!st) { box.appendChild(h("p", { class: "na" }, "Sem valores numéricos para calcular.")); return; }
+    const units = [...new Set(rows.map(r => r.units || data.metric.unit))];
+    const unit = units.length === 1 ? units[0] : "";
+    const f = v => isUptime ? fmtUptime(v) : `${fmt(v, 2)}${unit ? (unit.startsWith(" ") ? unit : " " + unit) : ""}`;
+    const hostOf = value => rows.find(r => r.value === value)?.host.name || "";
+    // Somar percentuais de hosts diferentes não tem significado: a soma só aparece para métricas que não são %.
+    const cards = [
+      ["Quantidade", String(st.n), ""],
+      ...(data.metric.percent ? [] : [["Soma", f(st.sum), ""]]),
+      ["Média", f(st.avg), ""], ["Mediana", f(st.median), ""], ["P95", f(st.p95), "95% dos valores ficam abaixo"],
+      ["Máximo", f(st.max), hostOf(st.max)], ["Mínimo", f(st.min), hostOf(st.min)],
+      ["Amplitude", f(st.range), "máx − mín"], ["Desvio padrão", f(st.std), "amostral"]
+    ];
+    const grid = h("div", { class: "rank-calc-grid" });
+    for (const [label, value, sub] of cards) {
+      grid.appendChild(h("div", { class: "rank-calc-item" }, h("span", {}, label), h("b", {}, value), sub ? h("small", { title: sub }, sub) : ""));
+    }
+    box.appendChild(grid);
+    if (units.length > 1) box.appendChild(h("p", { class: "rank-calc-warn" }, `Atenção: itens com unidades diferentes (${units.map(u => u.trim() || "sem unidade").join(", ")}); os valores são calculados sem conversão.`));
+    const copy = h("button", { type: "button", class: "rank-action" }, "Copiar tabela e cálculos");
+    copy.addEventListener("click", async () => {
+      const text = RankCalc.toTSV(rows, (v, r) => isUptime ? fmtUptime(v) : `${fmt(v, 2)}${(r.units || data.metric.unit) ? " " + String(r.units || data.metric.unit).trim() : ""}`, st,
+        s => cards.map(([label, value]) => [label, value]));
+      try { await navigator.clipboard.writeText(text); window.PanelUX?.toast("Tabela e cálculos copiados (cole no Excel ou Planilhas)"); }
+      catch { window.PanelUX?.toast("Não foi possível copiar automaticamente neste navegador"); }
+    });
+    box.appendChild(copy);
+  };
+  paint();
+  return box;
+}
+function ensureRankGeometry(board) {
+  applyRankMin(board);
+  const available = Math.max(280, board.clientWidth || (window.innerWidth - 80));
+  const gap = 14;
+  const columns = available >= 1050 ? 3 : available >= 680 ? 2 : 1;
+  const cardWidth = Math.max(rankMinW(), Math.floor((available - gap * (columns - 1)) / columns));
+  let changed = false;
+  rankSettings.forEach((settings, i) => {
+    const old = { x: settings.x, y: settings.y, w: settings.w, h: settings.h };
+    if (!Number.isFinite(Number(settings.w)) || Number(settings.w) < rankMinW()) settings.w = cardWidth;
+    if (!Number.isFinite(Number(settings.h)) || Number(settings.h) < 160) settings.h = 320;
+    if (!Number.isFinite(Number(settings.x))) settings.x = (i % columns) * (cardWidth + gap);
+    if (!Number.isFinite(Number(settings.y))) settings.y = Math.floor(i / columns) * (320 + gap);
+    settings.w = Math.min(available, Math.max(rankMinW(), Number(settings.w)));
+    settings.x = Math.max(0, Math.min(Number(settings.x), available - settings.w));
+    settings.y = Math.max(0, Number(settings.y));
+    settings.h = Math.max(160, Number(settings.h));
+    if (old.x !== settings.x || old.y !== settings.y || old.w !== settings.w || old.h !== settings.h) changed = true;
+  });
+  if (window.PanelNoOverlap) {
+    // Layout salvo com TOPs sobrepostos é reorganizado: cada card é empurrado para baixo até achar espaço livre.
+    const placed = [];
+    [...rankSettings].sort((a, b) => a.y - b.y || a.x - b.x).forEach(s => {
+      const f = PanelNoOverlap.resolve({ x: s.x, y: s.y, w: s.w, h: s.h }, placed, available);
+      if (f.x !== s.x || f.y !== s.y) { s.x = f.x; s.y = f.y; changed = true; }
+      placed.push({ x: s.x, y: s.y, w: s.w, h: s.h });
+    });
+  }
+  if (changed) persistRankLayout();
+}
+function updateRanksCanvasHeight() {
+  const board = document.getElementById("ranks");
+  if (!board) return;
+  const bottom = rankSettings.reduce((max, s) => Math.max(max, (Number(s.y) || 0) + (Number(s.h) || 320)), 320);
+  board.style.height = `${bottom + 20}px`;
+}
+
+function ensureRankAlignmentGuides(board) {
+  let vertical = board.querySelector(":scope > .free-alignment-guide.vertical");
+  let horizontal = board.querySelector(":scope > .free-alignment-guide.horizontal");
+  if (!vertical) { vertical = document.createElement("div"); vertical.className = "free-alignment-guide vertical"; vertical.setAttribute("aria-hidden", "true"); board.appendChild(vertical); }
+  if (!horizontal) { horizontal = document.createElement("div"); horizontal.className = "free-alignment-guide horizontal"; horizontal.setAttribute("aria-hidden", "true"); board.appendChild(horizontal); }
+  return { vertical, horizontal };
+}
+function snapRankPosition(section, left, top) {
+  const board = document.getElementById("ranks");
+  const guides = ensureRankAlignmentGuides(board);
+  const others = [...board.querySelectorAll(":scope > .rank")].filter(card => card !== section).map(card => ({
+    x: parseFloat(card.style.left) || 0, y: parseFloat(card.style.top) || 0, w: card.offsetWidth, h: card.offsetHeight
+  }));
+  const nearest = (pos, size, targets) => {
+    let best = null;
+    for (const point of [pos, pos + size / 2, pos + size]) for (const target of targets) {
+      const delta = target - point, distance = Math.abs(delta);
+      if (distance <= 8 && (!best || distance < best.distance)) best = { delta, target, distance };
+    }
+    return best;
+  };
+  const sx = nearest(left, section.offsetWidth, others.flatMap(o => [o.x, o.x + o.w / 2, o.x + o.w]));
+  const sy = nearest(top, section.offsetHeight, others.flatMap(o => [o.y, o.y + o.h / 2, o.y + o.h]));
+  if (sx) { left += sx.delta; guides.vertical.style.left = `${sx.target}px`; guides.vertical.style.display = "block"; } else guides.vertical.style.display = "none";
+  if (sy) { top += sy.delta; guides.horizontal.style.top = `${sy.target}px`; guides.horizontal.style.display = "block"; } else guides.horizontal.style.display = "none";
+  return { x: Math.max(0, left), y: Math.max(0, top) };
+}
+function hideRankAlignmentGuides(board = document.getElementById("ranks")) {
+  if (!board) return;
+  board.querySelectorAll(":scope > .free-alignment-guide").forEach(guide => { guide.style.display = "none"; });
+}
+function snapRankSize(section, settings, board) {
+  if (!isPanelLayoutEditing() || section.dataset.rankResizing !== "1") return;
+  const guides = ensureRankAlignmentGuides(board);
+  const x = Number(settings.x) || 0, y = Number(settings.y) || 0;
+  const others = [...board.querySelectorAll(":scope > .rank")].filter(card => card !== section).map(card => ({
+    x: parseFloat(card.style.left) || 0, y: parseFloat(card.style.top) || 0, w: card.offsetWidth, h: card.offsetHeight
+  }));
+  const nearest = (edge, targets, origin, minSize) => {
+    let best = null;
+    for (const target of targets) { const distance = Math.abs(target - edge); if (distance <= 8 && target - origin >= minSize && (!best || distance < best.distance)) best = { target, distance }; }
+    return best;
+  };
+  const sx = nearest(x + section.offsetWidth, others.flatMap(o => [o.x, o.x + o.w / 2, o.x + o.w]), x, rankMinW());
+  const sy = nearest(y + section.offsetHeight, others.flatMap(o => [o.y, o.y + o.h / 2, o.y + o.h]), y, 160);
+  if (sx) { const w = sx.target - x; if (Math.abs(section.offsetWidth - w) > 1) section.style.width = `${w}px`; settings.w = w; guides.vertical.style.left = `${sx.target}px`; guides.vertical.style.display = "block"; } else guides.vertical.style.display = "none";
+  if (sy) { const hgt = sy.target - y; if (Math.abs(section.offsetHeight - hgt) > 1) section.style.height = `${hgt}px`; settings.h = hgt; guides.horizontal.style.top = `${sy.target}px`; guides.horizontal.style.display = "block"; } else guides.horizontal.style.display = "none";
+}
+// Largura mínima dos TOPs (padrão 240). A grade "N por linha" pode reduzi-la; o valor fica guardado.
+const RANK_MIN_KEY = "painel-rank-minw";
+const rankMinW = () => { try { return Math.min(240, Number(localStorage.getItem(RANK_MIN_KEY)) || 240); } catch { return 240; } };
+const applyRankMin = board => board.style.setProperty("--rank-min", `${rankMinW()}px`);
+let rankBase = null, rankGhost = null;
+const rankSnapshot = board => [...board.querySelectorAll(":scope > .rank")].map(c => ({ card: c, x: parseFloat(c.style.left) || 0, y: parseFloat(c.style.top) || 0, w: c.offsetWidth, h: c.offsetHeight }));
+function rankApply(o, pos) {
+  o.card.style.left = `${pos.x}px`; o.card.style.top = `${pos.y}px`;
+  const st = rankSettings.find(s => s.id === o.card.dataset.rankId);
+  if (st) { st.x = pos.x; st.y = pos.y; }
+}
+// Estilo Sortable: os demais TOPs abrem espaço (a partir da posição inicial do gesto)...
+function rankReflow(moving, base) {
+  const others = base.filter(b => b.card !== moving);
+  const fixed = { x: parseFloat(moving.style.left) || 0, y: parseFloat(moving.style.top) || 0, w: moving.offsetWidth, h: moving.offsetHeight };
+  const pos = PanelNoOverlap.push(fixed, others);
+  others.forEach((o, i) => rankApply(o, pos[i]));
+  // Espaço-fantasma: onde o TOP vai assentar quando for solto (após compactar).
+  const dest = PanelNoOverlap.compact([fixed, ...others.map((o, i) => ({ x: pos[i].x, y: pos[i].y, w: o.w, h: o.h }))])[0];
+  if (!rankGhost) { rankGhost = document.createElement("div"); rankGhost.className = "free-drop-ghost"; moving.parentElement.appendChild(rankGhost); }
+  Object.assign(rankGhost.style, { left: `${dest.x}px`, top: `${dest.y}px`, width: `${fixed.w}px`, height: `${fixed.h}px` });
+  updateRanksCanvasHeight();
+}
+// ...e, ao soltar, todos sobem para preencher os vazios.
+function rankSettle(board) {
+  const list = rankSnapshot(board), pos = PanelNoOverlap.compact(list);
+  list.forEach((o, i) => rankApply(o, pos[i]));
+  rankBase = null; board.classList.remove("free-reflowing");
+  if (rankGhost) { rankGhost.remove(); rankGhost = null; }
+  persistRankLayout(); updateRanksCanvasHeight();
+}
+// Assistente de padronização dos TOPs (mesmo tamanho / N por linha), com Desfazer.
+function rankSuggest(section, board) {
+  if (!window.PanelUX?.suggestLayout || !window.PanelNoOverlap) return;
+  const count = rankSnapshot(board).length;
+  if (count < 2) return;
+  const size = { w: Math.round(section.offsetWidth), h: Math.round(section.offsetHeight) };
+  const width = board.clientWidth || 1000, gap = 14;
+  const cwFor = n => Math.floor((width - gap * (n - 1)) / n);
+  const setBox = (el, r) => {
+    Object.assign(el.style, { left: `${r.x}px`, top: `${r.y}px`, width: `${r.w}px`, height: `${r.h}px` });
+    const st = rankSettings.find(x => x.id === el.dataset.rankId);
+    if (st) { st.x = r.x; st.y = r.y; st.w = r.w; st.h = r.h; }
+  };
+  const apply = (build, undoExtra) => {
+    const list = rankSnapshot(board), prev = list.map(o => ({ card: o.card, x: o.x, y: o.y, w: o.w, h: o.h }));
+    build(list).forEach((r, i) => setBox(list[i].card, r));
+    rankSettle(board);
+    PanelUX.toast(`Layout aplicado a ${count} cards`, { action: "Desfazer", onAction: () => { if (undoExtra) undoExtra(); prev.forEach(p => setBox(p.card, p)); rankSettle(board); } });
+  };
+  PanelUX.suggestLayout({
+    count, sizeLabel: `${size.w}×${size.h}`,
+    maxPerRow: count,
+    tightFrom: (() => { for (let n = 1; n <= count; n++) if (cwFor(n) < 240) return n; return Infinity; })(),
+    minOk: n => cwFor(n) >= 80,
+    onSameSize: () => apply(list => {
+      const sized = list.map(o => ({ x: o.x, y: o.y, w: size.w, h: size.h }));
+      const pos = PanelNoOverlap.flow(sized, width);
+      return sized.map((o, i) => ({ x: pos[i].x, y: pos[i].y, w: size.w, h: size.h }));
+    }),
+    onGrid: n => {
+      // Se a coluna ficar mais estreita que 240px, reduz o mínimo dos TOPs (guardado) para o layout não sobrepor.
+      const prevMin = localStorage.getItem(RANK_MIN_KEY);
+      const setMin = v => { try { v ? localStorage.setItem(RANK_MIN_KEY, v) : localStorage.removeItem(RANK_MIN_KEY); } catch {} applyRankMin(board); };
+      setMin(cwFor(n) < 240 ? String(cwFor(n)) : null);
+      apply(list => PanelNoOverlap.gridLayout(list, n, width, gap), () => setMin(prevMin));
+    }
+  });
+}
+let rankTopZ = 10;
+let rankResizeObservers = new Map();
+function topList(index, list) {
+  const settings = rankSettings[index];
+  const board = document.getElementById("ranks");
+  const groups = [...new Set(list.flatMap(host => host.groups || []).filter(Boolean))].sort((a,b) => a.localeCompare(b,"pt-BR"));
+  if (settings.group && !groups.includes(settings.group)) settings.group = "";
+  const scopedList = settings.group ? list.filter(host => (host.groups || []).includes(settings.group)) : list;
+  const tags = [...new Set(scopedList.flatMap(allHostTags).map(t => t.tag).filter(Boolean))].sort((a,b) => a.localeCompare(b,"pt-BR"));
+  const tagOptions = [{ value: "", label: "Todas as tags" }, ...tags.map(t => ({ value: t, label: t }))];
+  if (settings.tag && !tags.includes(settings.tag)) settings.tag = "";
+  const values = settings.tag ? [...new Set(scopedList.flatMap(allHostTags).filter(t => t.tag === settings.tag).map(t => t.value).filter(v => v !== ""))].sort((a,b) => a.localeCompare(b,"pt-BR")) : [];
+  if (settings.tagValue && !values.includes(settings.tagValue)) settings.tagValue = "";
+  const itemOptions = itemsForSelection(scopedList, settings.tag, settings.tagValue);
+  if (settings.itemKey && (settings.itemKeyMode || "exact") === "exact" && !itemOptions.some(i => i.value === settings.itemKey)) {
+    settings.itemKey = ""; settings.itemKeyMode = "exact";
+  }
+  const metricOptions = Object.entries(RANK_METRICS).map(([value, m]) => ({ value, label: m.label }));
+  const selectedMetric = RANK_METRICS[settings.metric] || RANK_METRICS.cpu;
+  const section = h("section", { class: "rank", "data-rank-id": settings.id });
+  Object.assign(section.style, { left: `${settings.x}px`, top: `${settings.y}px`, width: `${settings.w}px`, height: `${settings.h}px`, zIndex: String(settings.z || 1), resize: isPanelLayoutEditing() ? "both" : "none" });
+  const chosen = itemOptions.find(i => i.value === settings.itemKey);
+  const titleText = () => {
+    if (settings.customTitle) return settings.customTitle;
+    if (settings.metric !== "item_value" || !settings.itemKey) return selectedMetric.title;
+    const mode = settings.itemKeyMode || (String(settings.itemKey).includes("*") ? "pattern" : "exact");
+    const selected = itemOptions.find(i => i.value === settings.itemKey);
+    return `TOP 10 — ${mode === "pattern" ? settings.itemKey : (selected?.label || settings.itemKey)}`;
+  };
+  const title = h("h3", {}, titleText());
+  const menuButton = h("button", { class: "rank-menu-btn", type: "button", title: "Configurar este TOP", "aria-label": "Configurar este TOP", "aria-expanded": "false" }, "⋮");
+  const actions = h("div", { class: "rank-actions" }, menuButton);
+  const head = h("div", { class: "rank-head" }, title, actions);
+  const config = h("div", { class: "rank-config", hidden: true });
+  menuButton.addEventListener("click", () => {
+    const opening = config.hidden;
+    config.hidden = !opening;
+    menuButton.setAttribute("aria-expanded", String(opening));
+    menuButton.title = opening ? "Fechar configurações" : "Configurar este TOP";
+  });
+  const duplicateButton = h("button", { class: "rank-action", type: "button", title: "Duplicar este TOP", "aria-label": "Duplicar este TOP" }, "Duplicar card");
+  duplicateButton.addEventListener("click", () => {
+    const copy = { ...settings, id: `rank-${rankIdCounter++}`, x: Math.min(Math.max(0, board.clientWidth - settings.w), settings.x + 24), y: settings.y + 24, z: ++rankTopZ, transform: { ...(settings.transform || { op: "none" }) } };
+    if (window.PanelNoOverlap) {
+      // A cópia não pode nascer sobre outro card: usa o primeiro espaço livre abaixo.
+      const others = rankSettings.map(s => ({ x: s.x, y: s.y, w: s.w, h: s.h }));
+      const f = PanelNoOverlap.resolve({ x: copy.x, y: copy.y, w: copy.w, h: copy.h }, others, board.clientWidth);
+      copy.x = f.x; copy.y = f.y;
+    }
+    rankSettings.splice(index + 1, 0, copy);
+    persistRankLayout(); renderRanks(hosts);
+  });
+  // Nome personalizado do card (independe da métrica monitorada). Duplo clique no título abre o campo.
+  const nameInput = h("input", { type: "text", placeholder: "Nome automático", maxlength: "60", "aria-label": "Nome do card" });
+  nameInput.value = settings.customTitle || "";
+  nameInput.addEventListener("input", () => { settings.customTitle = nameInput.value.trim().replace(/\s+/g, " ").slice(0, 60); saveRank(index); title.textContent = titleText(); });
+  title.addEventListener("dblclick", () => { if (!isPanelLayoutEditing()) return; if (config.hidden) menuButton.click(); nameInput.focus(); nameInput.select(); });
+  config.append(
+    h("label", {}, "Posicione arrastando pelo título e redimensione pelo canto inferior direito."),
+    h("label", {}, "Nome do card (vazio = automático)", nameInput),
+    duplicateButton,
+    selectControl("Grupo de hosts", [{ value: "", label: "Todos os grupos" }, ...groups.map(g => ({ value: g, label: g }))], settings.group || "", v => { settings.group = v; settings.tag = ""; settings.tagValue = ""; settings.itemKey = ""; settings.itemKeyMode = "exact"; saveRank(index); renderRanks(hosts); }),
+    selectControl("Tag do item", tagOptions, settings.tag, v => { settings.tag = v; settings.tagValue = ""; settings.itemKey = ""; settings.itemKeyMode = "exact"; saveRank(index); renderRanks(hosts); }),
+    selectControl("Valor da tag", [{ value: "", label: settings.tag ? "Todos os valores" : "Selecione uma tag" }, ...values.map(v => ({ value: v, label: v }))], settings.tagValue, v => { settings.tagValue = v; settings.itemKey = ""; settings.itemKeyMode = "exact"; saveRank(index); renderRanks(hosts); }),
+    (() => {
+      const safeId = String(settings.id).replace(/[^a-z0-9_-]/gi, "");
+      const currentMode = settings.itemKeyMode || (String(settings.itemKey || "").includes("*") ? "pattern" : "exact");
+      const inputValue = settings.itemKey ? (currentMode === "exact" ? (chosen ? chosen.label : settings.itemKey) : settings.itemKey) : "";
+      const input = h("input", { type: "text", value: inputValue, placeholder: "Digite para filtrar itens; use * como curinga", autocomplete: "off", "aria-label": "Item a medir (use * como curinga)" });
+      const suggestions = h("div", { class: "rank-item-suggestions", role: "listbox", "aria-label": "Itens correspondentes" });
+      const wrapper = h("div", { class: "rank-item-search" }, input, suggestions);
+      const label = h("div", { class: "rank-item-field" },
+        h("div", {}, "Item a medir — digite para filtrar; Enter aplica todos os resultados"), wrapper);
+      let currentMatches = [];
+      const hideSuggestions = () => suggestions.classList.remove("open");
+      const updateResults = () => {
+        const value = String(input.value || "").trim();
+        currentMatches = itemOptions.filter(opt => itemSearchMatches(value, opt));
+        suggestions.replaceChildren();
+        if (!value) { hideSuggestions(); return; }
+        suggestions.append(h("div", { class: "rank-item-suggestion-count" }, `${currentMatches.length} item(ns) correspondente(s). Clique para escolher só um item; pressione Enter para usar todos.`));
+        for (const option of currentMatches.slice(0, 40)) {
+          const btn = h("button", { class: "rank-item-suggestion", type: "button", role: "option", title: option.value }, option.label);
+          btn.addEventListener("pointerdown", e => e.preventDefault());
+          btn.addEventListener("click", () => {
+            settings.itemKey = option.value;
+            settings.itemKeyMode = "exact";
+            settings.metric = "item_value";
+            input.value = option.label;
+            saveRank(index);
+            hideSuggestions();
+            title.textContent = titleText();
+            results.replaceChildren(rankList(hosts, settings));
+          });
+          suggestions.append(btn);
+        }
+        if (currentMatches.length > 40) suggestions.append(h("div", { class: "rank-item-suggestion-count" }, `Mostrando 40 de ${currentMatches.length}. Refine a busca para reduzir a lista.`));
+        suggestions.classList.add("open");
+      };
+      const applyPattern = () => {
+        const query = String(input.value || "").trim();
+        if (!query) {
+          settings.itemKey = ""; settings.itemKeyMode = "pattern";
+        } else {
+          settings.itemKey = query;
+          settings.itemKeyMode = "pattern";
+          settings.metric = "item_value";
+        }
+        saveRank(index);
+        title.textContent = titleText();
+        results.replaceChildren(rankList(hosts, settings));
+        updateResults();
+      };
+      input.addEventListener("focus", updateResults);
+      input.addEventListener("input", () => {
+        updateResults();
+        const query = String(input.value || "").trim();
+        // O padrão é aplicado sem reconstruir o formulário, preservando foco
+        // e texto enquanto as opções e o ranking vão sendo filtrados.
+        settings.itemKey = query;
+        settings.itemKeyMode = "pattern";
+        if (query) settings.metric = "item_value";
+        saveRank(index);
+        title.textContent = titleText();
+        results.replaceChildren(rankList(hosts, settings));
+      });
+      input.addEventListener("keydown", e => {
+        if (e.key === "Enter") { e.preventDefault(); applyPattern(); hideSuggestions(); input.blur(); }
+        else if (e.key === "Escape") hideSuggestions();
+      });
+      input.addEventListener("blur", () => { setTimeout(hideSuggestions, 120); });
+      return label;
+    })(),
+    selectControl("Métrica", metricOptions, settings.metric, v => { settings.metric = v; saveRank(index); renderRanks(hosts); }),
+    (() => {
+      // Transformação do valor medido (vale para qualquer métrica do card).
+      const t = settings.transform = settings.transform || { op: "none" };
+      const factorInput = h("input", { type: "number", step: "any", inputmode: "decimal", value: t.factor === null || t.factor === undefined ? "" : String(t.factor), placeholder: "ex.: 1024", "aria-label": "Fator do cálculo" });
+      const unitInput = h("input", { type: "text", value: t.unit || "", placeholder: "ex.: KB", maxlength: "16", "aria-label": "Unidade do resultado" });
+      const fields = h("div", { class: "rank-transform-fields" },
+        h("label", {}, "Fator", factorInput),
+        h("label", {}, "Unidade do resultado (opcional)", unitInput));
+      const syncFields = () => { fields.hidden = !(t.op === "multiply" || t.op === "divide"); };
+      const refresh = () => { results.replaceChildren(rankList(hosts, settings)); };
+      factorInput.addEventListener("input", () => { const v = factorInput.value.trim(); t.factor = v === "" ? null : Number(v); saveRank(index); refresh(); });
+      unitInput.addEventListener("input", () => { t.unit = unitInput.value.trim(); saveRank(index); refresh(); });
+      const opControl = selectControl("Cálculo sobre o valor", [
+        { value: "none", label: "Sem cálculo (valor medido)" },
+        { value: "multiply", label: "Multiplicar por fator" },
+        { value: "divide", label: "Dividir por fator" },
+        { value: "percent", label: "Porcentagem (maior = 100%)" },
+        { value: "auto_unit", label: "Converter unidade (B, KB, MB…)" },
+      ], t.op || "none", v => { t.op = v; saveRank(index); syncFields(); refresh(); });
+      syncFields();
+      return h("div", { class: "rank-transform" }, opControl, fields);
+    })()
+  );
+  const results = h("div", { class: "rank-results" }, rankList(list, settings));
+  section.append(head, config, results);
+
+  // Arrastar pelo cabeçalho permite soltar em qualquer ponto do espaço livre, sem grid/snap.
+  let activeMove = null;
+  head.addEventListener("pointerdown", e => {
+    if (!isPanelLayoutEditing() || e.button !== 0 || e.target.closest("button, input, select, label")) return;
+    activeMove = { x: e.clientX, y: e.clientY, left: Number(settings.x) || 0, top: Number(settings.y) || 0, pointerId: e.pointerId };
+    settings.z = ++rankTopZ; section.style.zIndex = String(settings.z); section.classList.add("moving");
+    if (window.PanelNoOverlap) { rankBase = rankSnapshot(board); board.classList.add("free-reflowing"); }
+    section.setPointerCapture(e.pointerId); e.preventDefault();
+  });
+  section.addEventListener("pointermove", e => {
+    if (!activeMove || activeMove.pointerId !== e.pointerId) return;
+    const maxLeft = Math.max(0, board.clientWidth - section.offsetWidth);
+    const snapped = snapRankPosition(section, Math.max(0, Math.min(maxLeft, activeMove.left + e.clientX - activeMove.x)), Math.max(0, activeMove.top + e.clientY - activeMove.y));
+    settings.x = snapped.x; settings.y = snapped.y;
+    section.style.left = `${settings.x}px`; section.style.top = `${settings.y}px`;
+    if (window.PanelNoOverlap && rankBase) rankReflow(section, rankBase);
+    updateRanksCanvasHeight();
+  });
+  const finishMove = e => {
+    if (!activeMove || activeMove.pointerId !== e.pointerId) return;
+    activeMove = null; section.classList.remove("moving"); if (window.PanelNoOverlap) rankSettle(board); hideRankAlignmentGuides(board); persistRankLayout(); updateRanksCanvasHeight();
+  };
+  section.addEventListener("pointerup", finishMove); section.addEventListener("pointercancel", finishMove);
+
+  // O ResizeObserver grava as dimensões e encaixa arestas quando o usuário redimensiona pelo mouse.
+  if (!board.dataset.rankResizeEventsBound) {
+    board.dataset.rankResizeEventsBound = "1";
+    board.addEventListener("pointerdown", e => {
+      if (!isPanelLayoutEditing()) return;
+      const card = e.target.closest(".rank"); if (!card) return;
+      const rect = card.getBoundingClientRect();
+      if (e.clientX >= rect.right - 22 && e.clientY >= rect.bottom - 22) { card.dataset.rankResizing = "1"; card._startSize = { w: card.offsetWidth, h: card.offsetHeight }; if (window.PanelNoOverlap) { rankBase = rankSnapshot(board); board.classList.add("free-reflowing"); } }
+    });
+    const finishRankResize = () => {
+      const resizing = [...board.querySelectorAll(":scope > .rank[data-rank-resizing='1']")];
+      if (resizing.length) {
+        const resized = resizing.find(c => c._startSize && (Math.abs(c._startSize.w - c.offsetWidth) > 2 || Math.abs(c._startSize.h - c.offsetHeight) > 2));
+        resizing.forEach(card => delete card.dataset.rankResizing);
+        if (window.PanelNoOverlap) rankSettle(board);
+        hideRankAlignmentGuides(board); persistRankLayout();
+        if (resized) rankSuggest(resized, board);
+      }
+    };
+    document.addEventListener("pointerup", finishRankResize);
+    document.addEventListener("pointercancel", finishRankResize);
+  }
+  if (rankResizeObservers.has(settings.id)) rankResizeObservers.get(settings.id).disconnect();
+  const observer = new ResizeObserver(entries => {
+    const rect = entries[0]?.contentRect;
+    if (!rect) return;
+    snapRankSize(section, settings, board);
+    if (window.PanelNoOverlap && isPanelLayoutEditing() && rankBase && section.dataset.rankResizing === "1") rankReflow(section, rankBase);
+    const w = Math.round(section.offsetWidth), hgt = Math.round(section.offsetHeight);
+    if (Math.abs((settings.w || 0) - w) > 1 || Math.abs((settings.h || 0) - hgt) > 1) {
+      settings.x = Math.max(0, Number(settings.x) || 0);
+      settings.w = Math.max(rankMinW(), Math.min(w, Math.max(rankMinW(), board.clientWidth - settings.x)));
+      settings.h = Math.max(160, hgt);
+      const maxLeft = Math.max(0, board.clientWidth - settings.w);
+      settings.x = Math.min(settings.x, maxLeft);
+      section.style.left = `${settings.x}px`;
+      section.style.width = `${settings.w}px`;
+      persistRankLayout(); updateRanksCanvasHeight();
+    }
+  });
+  observer.observe(section); rankResizeObservers.set(settings.id, observer);
+  return section;
+}
+function persistRankLayout() {
+  try { localStorage.setItem("painel-ranks-layout-v1", JSON.stringify(rankSettings)); } catch {}
+}
+function saveRank(index) {
+  persistRankLayout();
+  try { localStorage.setItem(`painel-rank-${index}`, JSON.stringify(rankSettings[index])); } catch {}
+}
+function renderRanks(list) {
+  const board = document.getElementById("ranks");
+  ensureRankGeometry(board);
+  // Ao reconstruir os cards, desconecta os observadores anteriores para não acumular callbacks.
+  for (const observer of rankResizeObservers.values()) observer.disconnect();
+  rankResizeObservers = new Map();
+  board.replaceChildren(...rankSettings.map((_, index) => topList(index, list)));
+  ensureRankAlignmentGuides(board);
+  updateRanksCanvasHeight();
+}
+
+/* ---------- Cartões (servidores) ---------- */
+function sortDefault(a, b) {
+  return a.name.localeCompare(b.name, "pt-BR", { numeric: true, sensitivity: "base" });
+}
+
+function severityControls() {
+  const box = h("section", { class: "rank" });
+  box.append(h("div", { class: "rank-head" }, h("h3", {}, "Alertas exibidos nos cards")));
+  const choices = h("div", { class: "rank-config" });
+  SEV.forEach((label, severity) => {
+    if (severity === 0 || severity === 1) return;
+    const input = h("input", { type: "checkbox", value: String(severity) });
+    input.checked = visibleSeverities.includes(severity);
+    input.addEventListener("change", () => {
+      visibleSeverities = [...choices.querySelectorAll('input[type="checkbox"]:checked')].map(el => Number(el.value));
+      try { localStorage.setItem("painel-card-severities", JSON.stringify(visibleSeverities)); } catch {}
+      render();
+    });
+    choices.append(h("label", { style: "display:flex;align-items:center;gap:6px;flex-direction:row" }, input, label));
+  });
+  box.append(choices);
+  return box;
+}
+function renderCards(list) {
+  const grid = h("div", { class: "cards" });
+  for (const s of [...list].sort(sortDefault)) {
+    const card = h("article", { class: `srv ${s.status}` },
+      h("header", {}, h("span", { class: "dot", title: STATUS[s.status] }), h("h2", {}, s.name),
+        h("span", { class: "uptime" }, s.uptime !== null ? `UpTime ${fmtUptime(s.uptime)}` : STATUS[s.status])));
+    if (s.status === "offline") {
+      card.append(h("p", { class: "down-msg" }, "O Zabbix não consegue falar com este servidor."));
+    } else {
+      card.append(
+        h("div", { class: "row" }, h("span", {}, "CPU"), meter(s.cpu, "CPU", "cpu")),
+        h("div", { class: "row" }, h("span", {}, "Memória"), meter(s.mem, "Memória", "mem")),
+        h("div", { class: "row" }, h("span", {}, "Disco"), meter(s.disk.worst, "Disco mais cheio", "disk")));
+      const extra = [];
+      if (s.icmp_response_ms !== null && s.icmp_response_ms !== undefined) extra.push(`Resposta ICMP: ${fmt(s.icmp_response_ms, 2)} ms`);
+      if (s.icmp_loss !== null && s.icmp_loss !== undefined) extra.push(`Perda ICMP: ${fmt(s.icmp_loss, 2)}%`);
+      if (s.load !== null) extra.push(`Carga média (1 min): ${fmt(s.load, 2)}`);
+      if (s.disk.mounts.length > 1) extra.push("Volumes: " + s.disk.mounts.map(m => `${m.name} ${fmt(m.pused)}%`).join(", "));
+      if (extra.length) card.append(h("p", { class: "meta" }, extra.join(". ")));
+    }
+    if (s.availability !== null && s.availability !== undefined) {
+      card.append(h("p", { class: "meta" }, `Disponibilidade ${availHours} h: ${fmt(s.availability, 2)}%`));
+    }
+    const issues = collectionIssues(s);
+    if (issues.length) card.append(h("p", { class: "meta warn-text" }, "Coleta: " + issues.join(". ")));
+    const shownProblems = (s.problems.top || []).filter(t => visibleSeverities.includes(Number(t.severity)));
+    if (shownProblems.length) {
+      card.append(h("ul", { class: "issues" }, ...shownProblems.map(t => h("li", {}, h("span", { class: `chip sev-${t.severity}` }, SEV[t.severity]), " ", t.name))));
+    }
+    grid.append(card);
+  }
+  return grid;
+}
+
+/* ---------- Tabela (computadores e todos os hosts) ---------- */
+const COLS = [
+  { key: "status", label: "Estado", val: s => STATUS_W[s.status], cell: statusBadge },
+  { key: "name", label: VIEW.nameLabel, val: s => s.name.toLowerCase(), cell: s => h("strong", {}, s.name) },
+  { key: "kind", label: "Tipo", only: "all", val: s => KIND[s.kind], cell: s => KIND[s.kind] },
+  { key: "cpu", label: "CPU", val: s => s.cpu ?? -1, cell: s => meter(s.cpu, "CPU", "cpu") },
+  { key: "mem", label: "Memória", val: s => s.mem ?? -1, cell: s => meter(s.mem, "Memória", "mem") },
+  { key: "disk", label: "Disco", val: s => s.disk.worst ?? -1, cell: s => meter(s.disk.worst, "Disco mais cheio", "disk") },
+  { key: "avail", label: "Disp.", val: s => s.availability ?? -1,
+    cell: s => (s.availability === null || s.availability === undefined ? h("span", { class: "na" }, "–") : `${fmt(s.availability, 1)}%`) },
+  { key: "icmp_loss", label: "Perda ICMP", val: s => s.icmp_loss ?? -1,
+    cell: s => (s.icmp_loss === null || s.icmp_loss === undefined ? h("span", { class: "na" }, "–") : `${fmt(s.icmp_loss, 2)}%`) },
+  { key: "icmp_response_ms", label: "Resposta ICMP", val: s => s.icmp_response_ms ?? -1,
+    cell: s => (s.icmp_response_ms === null || s.icmp_response_ms === undefined ? h("span", { class: "na" }, "–") : `${fmt(s.icmp_response_ms, 2)} ms`) },
+  { key: "uptime", label: "Ligado há", val: s => s.uptime ?? -1, cell: s => fmtUptime(s.uptime) },
+  { key: "problems", label: "Problemas", val: s => (s.problems.count ? s.problems.max * 1000 + s.problems.count : -1), cell: problemChip },
+  { key: "collection", label: "Coleta", val: s => collectionIssues(s).length, cell: collectionCell },
+].filter(c => !c.only || c.only === viewKey);
+
+function renderTable(list) {
+  COLS.find(c => c.key === "avail").label = `Disp. ${availHours} h`;
+  const col = COLS.find(c => c.key === sort.key);
+  const rows = [...list].sort((a, b) => {
+    const x = col.val(a), y = col.val(b);
+    const r = x < y ? -1 : x > y ? 1 : 0;
+    return (r * sort.dir) || sortDefault(a, b);
+  });
+  const head = h("tr", {}, ...COLS.map(c => {
+    const th = h("th", { scope: "col", "aria-sort": c.key === sort.key ? (sort.dir === 1 ? "ascending" : "descending") : "none" });
+    const b = h("button", { type: "button" }, c.label);
+    b.addEventListener("click", () => {
+      sort = c.key === sort.key ? { key: c.key, dir: -sort.dir } : { key: c.key, dir: ["status", "name", "kind"].includes(c.key) ? 1 : -1 };
+      render();
+    });
+    th.append(b);
+    return th;
+  }));
+  const body = h("tbody", {}, ...rows.map(s => h("tr", {}, ...COLS.map(c => h("td", {}, c.cell(s))))));
+  return h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, head), body));
+}
+
+/* Edição de layout: mover/redimensionar e alterar leituras só ficam liberados ao clicar em Editar painel. */
+function isPanelLayoutEditing() { return document.body.classList.contains("layout-edit-active"); }
+function setupPanelEditMode() {
+  const button = document.getElementById("layout-edit-toggle");
+  if (!button || button.dataset.bound) return;
+  button.dataset.bound = "1";
+  let restoreButton = document.getElementById("restore-hidden-cards");
+  if (!restoreButton) {
+    restoreButton = document.createElement("button");
+    restoreButton.id = "restore-hidden-cards";
+    restoreButton.type = "button";
+    restoreButton.className = "layout-edit-toggle";
+    restoreButton.textContent = "Restaurar cards excluídos";
+    restoreButton.title = "Restaurar todos os cards ocultados nesta página";
+    restoreButton.hidden = true;
+    button.insertAdjacentElement("afterend", restoreButton);
+    restoreButton.addEventListener("click", () => {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith("painel-hidden-cards:")) localStorage.removeItem(key);
+      }
+      window.location.reload();
+    });
+  }
+  const setMode = enabled => {
+    restoreButton.hidden = !enabled;
+    document.body.classList.toggle("layout-edit-active", enabled);
+    button.setAttribute("aria-pressed", String(enabled));
+    button.textContent = enabled ? "Concluir edição" : "Editar painel";
+    button.title = enabled ? "Salvar o layout e sair do modo de edição" : "Liberar ajustes de layout e configuração dos itens Zabbix";
+    document.querySelectorAll(".free-card-managed").forEach(card => {
+      card.style.resize = enabled ? "both" : "none";
+      card.querySelectorAll(":scope > header, :scope > h3, :scope > .label").forEach(handle => { handle.style.cursor = enabled ? "grab" : "default"; });
+    });
+    document.querySelectorAll(".rank").forEach(card => { card.style.resize = enabled ? "both" : "none"; });
+    document.querySelectorAll(".rank-head").forEach(handle => { handle.style.cursor = enabled ? "grab" : "default"; handle.style.touchAction = enabled ? "none" : "auto"; });
+    if (!enabled) {
+      document.querySelectorAll(".rank-config").forEach(config => { config.hidden = true; });
+      document.querySelectorAll(".rank-menu-btn").forEach(menu => menu.setAttribute("aria-expanded", "false"));
+      document.querySelectorAll(".free-alignment-guide").forEach(guide => { guide.style.display = "none"; });
+    }
+    window.dispatchEvent(new CustomEvent("panel-layout-edit-change", { detail: { enabled } }));
+  };
+  button.addEventListener("click", () => setMode(!isPanelLayoutEditing()));
+  setMode(false);
+}
+setupPanelEditMode();
+window.addEventListener("panel-layout-edit-change", event => {
+  const enabled = !!event.detail?.enabled;
+  document.querySelectorAll(".rank").forEach(card => { card.style.resize = enabled ? "both" : "none"; });
+});
+
+let panelDataRevision = 0;
+// Pausa atualizações automáticas enquanto o usuário edita o layout. A mudança
+// de revisão invalida qualquer resposta HTTP que já estivesse em andamento.
+window.addEventListener("panel-layout-edit-change", event => {
+  panelDataRevision += 1;
+  if (!event.detail?.enabled) refresh();
+});
+
+function ensureFreeAlignmentGuides(parent) {
+  let vertical = parent.querySelector(":scope > .free-alignment-guide.vertical");
+  let horizontal = parent.querySelector(":scope > .free-alignment-guide.horizontal");
+  if (!vertical) { vertical = document.createElement("div"); vertical.className = "free-alignment-guide vertical"; vertical.setAttribute("aria-hidden", "true"); parent.appendChild(vertical); }
+  if (!horizontal) { horizontal = document.createElement("div"); horizontal.className = "free-alignment-guide horizontal"; horizontal.setAttribute("aria-hidden", "true"); parent.appendChild(horizontal); }
+  return { vertical, horizontal };
+}
+
+/* Layout livre comum: cartões podem ser movidos e redimensionados com o mouse.
+   Cada área salva suas coordenadas no navegador e restaura-as após a atualização. */
+function freeCardLayout(parentOrSelector, selector, storageName, options = {}) {
+  const parent = typeof parentOrSelector === "string" ? document.querySelector(parentOrSelector) : parentOrSelector;
+  if (!parent) return;
+  const cards = [...parent.querySelectorAll(`:scope > ${selector}`)];
+  if (!cards.length) return;
+  const gap = options.gap ?? 14;
+  const baseMinW = options.minWidth ?? 220;
+  // Largura mínima efetiva: a grade "N por linha" pode reduzi-la (guardado por grupo) para caber mais cards por linha.
+  try { parent._freeMinW = Number(localStorage.getItem(`painel-card-minw:${storageName}`)) || 0; } catch { parent._freeMinW = 0; }
+  const minW = () => Math.min(baseMinW, parent._freeMinW || baseMinW);
+  const minH = options.minHeight ?? 110;
+  const available = Math.max(320, parent.clientWidth || (window.innerWidth - 80));
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(`painel-free-cards:${storageName}`) || "{}") || {}; } catch {}
+  let hiddenCards = [];
+  try { hiddenCards = JSON.parse(localStorage.getItem(`painel-hidden-cards:${storageName}`) || "[]") || []; } catch {}
+  for (const card of cards) {
+    const titleNode = card.querySelector(":scope > header h2, :scope > h2, :scope > h3, :scope > .label, :scope > span, h2, h3, .label");
+    const title = card.dataset.freeOrigTitle || (titleNode?.textContent || card.className || "card").trim().replace(/\s+/g, " ").slice(0, 140);
+    const key = `${[...card.classList].filter(c => !["online", "offline", "unknown", "moving", "free-card-moving"].includes(c)).sort().join(".")}:${title}`;
+    if (hiddenCards.includes(key)) card.style.display = "none";
+  }
+  const visibleCards = cards.filter(card => card.style.display !== "none");
+  if (!visibleCards.length) {
+    parent.style.position = "relative"; parent.style.minHeight = "40px";
+    parent.dataset.freeStorageName = storageName;
+    return;
+  }
+  parent.style.position = "relative";
+  parent.style.display = "block";
+  parent.style.width = "100%";
+  parent.style.minHeight = `${minH}px`;
+  parent.style.overflow = "visible";
+
+  // Título exibido pode ser personalizado pelo usuário; a CHAVE de layout usa sempre o título original
+  // (dataset.freeOrigTitle), para que renomear nunca perca posição/tamanho salvos.
+  const titleNodeFor = card => [
+    card.querySelector(":scope > header h2"), card.querySelector(":scope > h2"),
+    card.querySelector(":scope > h3"), card.querySelector(":scope > .label"),
+    card.querySelector(":scope > span"), card.querySelector("h2"), card.querySelector("h3"),
+    card.querySelector(".label")
+  ].find(n => n && n.textContent.trim());
+  const titleFor = card => card.dataset.freeOrigTitle ||
+    (titleNodeFor(card)?.textContent || card.className || "card").trim().replace(/\s+/g, " ").slice(0, 140);
+  const nameStore = `painel-card-names:${storageName}`;
+  const readNames = () => { try { return JSON.parse(localStorage.getItem(nameStore) || "{}") || {}; } catch { return {}; } };
+  const writeName = (key, value) => {
+    const names = readNames(); if (value) names[key] = value; else delete names[key];
+    try { localStorage.setItem(nameStore, JSON.stringify(names)); } catch {}
+  };
+  const applyCustomName = (card, key) => {
+    const name = readNames()[key], node = titleNodeFor(card);
+    if (!name || !node) return;
+    if (!card.dataset.freeOrigTitle) card.dataset.freeOrigTitle = titleFor(card);
+    node.textContent = name;
+  };
+  // Edição inline do nome: Enter/clique fora salva, Esc cancela, vazio restaura o nome original.
+  const startRename = card => {
+    const node = titleNodeFor(card);
+    if (!node || node.querySelector("input")) return;
+    const key = card.dataset.freeCardKey, shown = node.textContent.trim(), orig = card.dataset.freeOrigTitle || shown;
+    const input = document.createElement("input");
+    input.type = "text"; input.className = "free-card-name-input"; input.value = shown; input.maxLength = 60;
+    input.setAttribute("aria-label", "Nome do card (deixe vazio para restaurar o original)");
+    node.textContent = ""; node.appendChild(input); input.focus(); input.select();
+    let finished = false;
+    const finish = save => {
+      if (finished) return; finished = true;
+      const value = input.value.trim().replace(/\s+/g, " ");
+      if (!save) { node.textContent = shown; return; }
+      if (!value || value === orig) { writeName(key, ""); delete card.dataset.freeOrigTitle; node.textContent = orig; }
+      else { writeName(key, value); card.dataset.freeOrigTitle = orig; node.textContent = value; }
+    };
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); finish(true); } else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+      e.stopPropagation();
+    });
+    input.addEventListener("blur", () => finish(true));
+  };
+  const keyFor = card => `${[...card.classList].filter(c => !["online", "offline", "unknown", "moving", "free-card-moving"].includes(c)).sort().join(".")}:${titleFor(card)}`;
+  const widthFor = card => {
+    if (typeof options.widthFor === "function") return Math.max(minW(), Math.min(available, options.widthFor(card, available)));
+    if (card.classList.contains("stat")) return Math.min(210, Math.max(150, (available - gap * 3) / 4));
+    if (card.classList.contains("switch")) return Math.max(420, Math.min(960, available - 28));
+    if (card.classList.contains("rank")) return Math.max(300, Math.min(450, (available - gap) / 2));
+    return Math.max(minW(), Math.min(360, available - gap));
+  };
+  const heightFor = card => {
+    if (typeof options.heightFor === "function") return options.heightFor(card);
+    if (card.classList.contains("stat")) return 86;
+    if (card.classList.contains("switch")) return 175;
+    if (card.classList.contains("rank")) return 220;
+    if (card.classList.contains("card")) return 175;
+    return 230;
+  };
+  const items = visibleCards.map((card, i) => {
+    const key = keyFor(card);
+    card.dataset.freeCardKey = key;
+    applyCustomName(card, key);
+    const record = saved[key] && Number.isFinite(Number(saved[key].x)) ? saved[key] : null;
+    card.style.position = "absolute";
+    card.style.boxSizing = "border-box";
+    card.style.margin = "0";
+    card.style.maxWidth = "none";
+    card.style.maxHeight = "none";
+    card.style.minWidth = `${minW()}px`;
+    card.style.minHeight = `${minH}px`;
+    card.classList.add("free-card-managed");
+    card.style.resize = isPanelLayoutEditing() ? "both" : "none";
+    card.style.overflow = "auto";
+    card.style.touchAction = "auto";
+    card.style.width = `${Math.max(minW(), Number(record?.w) || widthFor(card))}px`;
+    card.style.height = record?.h ? `${Math.max(minH, Number(record.h))}px` : "auto";
+    card.style.left = `${Math.max(0, Number(record?.x) || 0)}px`;
+    card.style.top = `${Math.max(0, Number(record?.y) || 0)}px`;
+    card.style.zIndex = String(Number(record?.z) || (100 + i));
+    card.style.cursor = "default";
+    return { card, key, record, index: i };
+  });
+
+  const anySaved = items.some(x => x.record);
+  if (!anySaved) {
+    let x = 0, y = 0, rowHeight = 0;
+    for (const item of items) {
+      const w = widthFor(item.card);
+      item.card.style.width = `${w}px`;
+      item.card.style.height = "auto";
+      if (x > 0 && x + w > available) { x = 0; y += rowHeight + gap; rowHeight = 0; }
+      item.card.style.left = `${x}px`; item.card.style.top = `${y}px`;
+      const h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+      item.card.style.height = `${h}px`;
+      item.record = { x, y, w, h, z: 100 + item.index };
+      rowHeight = Math.max(rowHeight, h); x += w + gap;
+    }
+  } else {
+    let bottom = 0;
+    for (const item of items) if (item.record) bottom = Math.max(bottom, Number(item.record.y || 0) + Number(item.record.h || item.card.offsetHeight || minH));
+    for (const item of items) {
+      if (!item.record) {
+        const w = widthFor(item.card), h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+        item.record = { x: 0, y: bottom + gap, w, h, z: 100 + item.index };
+        item.card.style.left = "0px"; item.card.style.top = `${item.record.y}px`;
+        item.card.style.width = `${w}px`; item.card.style.height = `${h}px`;
+        bottom += h + gap;
+      } else if (!item.record.h) {
+        item.record.h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+        item.card.style.height = `${item.record.h}px`;
+      }
+    }
+  }
+
+  // Anti-sobreposição (estilo Sortable): ao arrastar/redimensionar, os outros cards abrem espaço (empurrados para
+  // baixo a partir da posição que tinham no início do gesto); ao soltar, o layout é compactado e preenche os vazios.
+  const rectOf = card => ({ x: parseFloat(card.style.left) || 0, y: parseFloat(card.style.top) || 0, w: card.offsetWidth, h: card.offsetHeight });
+  const snapshot = () => items.filter(i => i.card.style.display !== "none").map(i => ({ card: i.card, ...rectOf(i.card) }));
+  let dragBase = null, resizeBase = null, ghost = null;
+  const reflow = (moving, base) => {
+    const others = base.filter(b => b.card !== moving);
+    const pos = PanelNoOverlap.push(rectOf(moving), others);
+    others.forEach((o, i) => { o.card.style.left = `${pos[i].x}px`; o.card.style.top = `${pos[i].y}px`; });
+    // Espaço-fantasma: onde o card vai assentar quando for solto (após compactar).
+    const mine = rectOf(moving);
+    const dest = PanelNoOverlap.compact([mine, ...others.map((o, i) => ({ x: pos[i].x, y: pos[i].y, w: o.w, h: o.h }))])[0];
+    if (!ghost) { ghost = document.createElement("div"); ghost.className = "free-drop-ghost"; parent.appendChild(ghost); }
+    Object.assign(ghost.style, { left: `${dest.x}px`, top: `${dest.y}px`, width: `${mine.w}px`, height: `${mine.h}px` });
+    resizeCanvas();
+  };
+  const settle = () => {
+    if (window.PanelNoOverlap) {
+      const list = snapshot(), pos = PanelNoOverlap.compact(list);
+      list.forEach((o, i) => { o.card.style.left = `${pos[i].x}px`; o.card.style.top = `${pos[i].y}px`; });
+    }
+    dragBase = null; resizeBase = null; parent.classList.remove("free-reflowing");
+    if (ghost) { ghost.remove(); ghost = null; }
+    resizeCanvas();
+  };
+  // Assistente: após redimensionar um card, sugere padronizar o grupo (mesmo tamanho ou N por linha, alinhado). Com Desfazer.
+  const suggestLayout = card => {
+    if (!window.PanelUX?.suggestLayout || !window.PanelNoOverlap) return;
+    const count = snapshot().length;
+    if (count < 2) return;
+    const size = { w: Math.round(card.offsetWidth), h: Math.round(card.offsetHeight) };
+    const width = parent.clientWidth || available;
+    const cwFor = n => Math.floor((width - gap * (n - 1)) / n);
+    const minKey = `painel-card-minw:${storageName}`;
+    const apply = (build, undoExtra) => {
+      const list = snapshot();
+      const prev = list.map(o => ({ card: o.card, left: o.card.style.left, top: o.card.style.top, width: o.card.style.width, height: o.card.style.height }));
+      build(list).forEach((r, i) => {
+        const el = list[i].card;
+        el.style.left = `${r.x}px`; el.style.top = `${r.y}px`; el.style.width = `${r.w}px`; el.style.height = `${r.h}px`;
+      });
+      settle(); persist(); resizeCanvas();
+      PanelUX.toast(`Layout aplicado a ${count} cards`, { action: "Desfazer", onAction: () => {
+        if (undoExtra) undoExtra();
+        prev.forEach(p => Object.assign(p.card.style, { left: p.left, top: p.top, width: p.width, height: p.height }));
+        settle(); persist(); resizeCanvas();
+      } });
+    };
+    PanelUX.suggestLayout({
+      count, sizeLabel: `${size.w}×${size.h}`,
+      maxPerRow: count,
+      tightFrom: (() => { for (let n = 1; n <= count; n++) if (cwFor(n) < baseMinW) return n; return Infinity; })(),
+      minOk: n => cwFor(n) >= 80,
+      onSameSize: () => apply(list => {
+        const sized = list.map(o => ({ x: o.x, y: o.y, w: size.w, h: size.h }));
+        const pos = PanelNoOverlap.flow(sized, width);
+        return sized.map((o, i) => ({ x: pos[i].x, y: pos[i].y, w: size.w, h: size.h }));
+      }),
+      onGrid: n => {
+        // Se a coluna ficar mais estreita que o mínimo padrão, reduz o mínimo do grupo (e guarda) para o layout não sobrepor.
+        const prevMin = parent._freeMinW || 0, setMin = v => {
+          parent._freeMinW = v;
+          try { v ? localStorage.setItem(minKey, String(v)) : localStorage.removeItem(minKey); } catch {}
+          snapshot().forEach(o => { o.card.style.minWidth = `${minW()}px`; });
+        };
+        setMin(cwFor(n) < baseMinW ? cwFor(n) : 0);
+        apply(list => PanelNoOverlap.gridLayout(list, n, width, gap), () => setMin(prevMin));
+      }
+    });
+  };
+  if (window.PanelNoOverlap) {
+    // Layout salvo/inicial com cards sobrepostos é reorganizado ao abrir (empurra para baixo).
+    const placed = [];
+    [...items].sort((a, b) => rectOf(a.card).y - rectOf(b.card).y || rectOf(a.card).x - rectOf(b.card).x).forEach(({ card }) => {
+      const r = rectOf(card), f = PanelNoOverlap.resolve(r, placed, available);
+      card.style.left = `${f.x}px`; card.style.top = `${f.y}px`;
+      placed.push({ x: f.x, y: f.y, w: r.w, h: r.h });
+    });
+  }
+  let maxZ = Math.max(100, ...items.map(x => Number(x.record?.z) || 100));
+  const persist = () => {
+    const out = {};
+    for (const { card, key } of items) out[key] = {
+      x: Math.max(0, Math.round(parseFloat(card.style.left) || 0)),
+      y: Math.max(0, Math.round(parseFloat(card.style.top) || 0)),
+      w: Math.max(minW(), Math.round(card.offsetWidth)),
+      h: Math.max(minH, Math.round(card.offsetHeight)),
+      z: Number(card.style.zIndex) || 100
+    };
+    try { localStorage.setItem(`painel-free-cards:${storageName}`, JSON.stringify({ ...saved, ...out })); } catch {}
+  };
+  if (parent._freeCardLayoutContext) parent._freeCardLayoutContext.persist = persist;
+  const resizeCanvas = () => {
+    let bottom = 0;
+    for (const {card} of items) bottom = Math.max(bottom, (parseFloat(card.style.top) || 0) + card.offsetHeight);
+    parent.style.height = `${Math.max(minH, bottom + gap)}px`;
+  };
+  const guides = ensureFreeAlignmentGuides(parent);
+  const hideGuides = () => { guides.vertical.style.display = "none"; guides.horizontal.style.display = "none"; };
+  if (parent._freeCardLayoutContext) { parent._freeCardLayoutContext.items = items; parent._freeCardLayoutContext.hideGuides = hideGuides; parent._freeCardLayoutContext.resizeCanvas = resizeCanvas; }
+  const nearestSnap = (position, size, targets) => {
+    const points = [position, position + size / 2, position + size];
+    let best = null;
+    for (const point of points) for (const target of targets) {
+      const delta = target - point, distance = Math.abs(delta);
+      if (distance <= 8 && (!best || distance < best.distance)) best = { delta, target, distance };
+    }
+    return best;
+  };
+  const snapFreePosition = (card, left, top) => {
+    const others = items.filter(item => item.card !== card).map(({card: other}) => ({
+      x: parseFloat(other.style.left) || 0, y: parseFloat(other.style.top) || 0,
+      w: other.offsetWidth, h: other.offsetHeight
+    }));
+    const xTargets = others.flatMap(o => [o.x, o.x + o.w / 2, o.x + o.w]);
+    const yTargets = others.flatMap(o => [o.y, o.y + o.h / 2, o.y + o.h]);
+    const sx = nearestSnap(left, card.offsetWidth, xTargets);
+    const sy = nearestSnap(top, card.offsetHeight, yTargets);
+    if (sx) { left += sx.delta; guides.vertical.style.left = `${sx.target}px`; guides.vertical.style.display = "block"; }
+    else guides.vertical.style.display = "none";
+    if (sy) { top += sy.delta; guides.horizontal.style.top = `${sy.target}px`; guides.horizontal.style.display = "block"; }
+    else guides.horizontal.style.display = "none";
+    return { x: Math.max(0, left), y: Math.max(0, top) };
+  };
+  const snapFreeSize = card => {
+    if (!isPanelLayoutEditing() || card.dataset.freeResizing !== "1") return;
+    const left = parseFloat(card.style.left) || 0, top = parseFloat(card.style.top) || 0;
+    const others = items.filter(item => item.card !== card).map(({card: other}) => ({
+      x: parseFloat(other.style.left) || 0, y: parseFloat(other.style.top) || 0,
+      w: other.offsetWidth, h: other.offsetHeight
+    }));
+    const xTargets = others.flatMap(o => [o.x, o.x + o.w / 2, o.x + o.w]);
+    const yTargets = others.flatMap(o => [o.y, o.y + o.h / 2, o.y + o.h]);
+    const snapEdge = (edge, targets, origin, minSize) => {
+      let best = null;
+      for (const target of targets) { const d = Math.abs(target - edge); if (d <= 8 && target - origin >= minSize && (!best || d < best.distance)) best = { target, distance: d }; }
+      return best;
+    };
+    const sx = snapEdge(left + card.offsetWidth, xTargets, left, minW());
+    const sy = snapEdge(top + card.offsetHeight, yTargets, top, minH);
+    if (sx) { const w = sx.target - left; if (Math.abs(card.offsetWidth - w) > 1) card.style.width = `${w}px`; guides.vertical.style.left = `${sx.target}px`; guides.vertical.style.display = "block"; }
+    else guides.vertical.style.display = "none";
+    if (sy) { const h = sy.target - top; if (Math.abs(card.offsetHeight - h) > 1) card.style.height = `${h}px`; guides.horizontal.style.top = `${sy.target}px`; guides.horizontal.style.display = "block"; }
+    else guides.horizontal.style.display = "none";
+  };
+  parent._freeCardLayoutContext = { items, persist, resizeCanvas, hideGuides, settle, suggest: suggestLayout };
+  if (!parent.dataset.freeLayoutPointerUpBound) {
+    parent.dataset.freeLayoutPointerUpBound = "1";
+    const finishResize = () => {
+      const ctx = parent._freeCardLayoutContext;
+      if (!ctx) return;
+      let changed = false, resized = null;
+      for (const {card} of ctx.items) if (card.dataset.freeResizing === "1") {
+        delete card.dataset.freeResizing; changed = true;
+        const s0 = card._startSize;
+        if (s0 && (Math.abs(s0.w - card.offsetWidth) > 2 || Math.abs(s0.h - card.offsetHeight) > 2)) resized = card;
+      }
+      if (changed) {
+        ctx.hideGuides(); if (ctx.settle) ctx.settle(); if (ctx.persist) ctx.persist(); ctx.resizeCanvas();
+        if (resized && ctx.suggest) ctx.suggest(resized);
+      }
+    };
+    document.addEventListener("pointerup", finishResize);
+    document.addEventListener("pointercancel", finishResize);
+  }
+  for (const { card, key } of items) {
+    if (!card.querySelector(".free-card-grip")) {
+      const grip = document.createElement("button");
+      grip.type = "button"; grip.className = "free-card-grip"; grip.textContent = "⠿";
+      grip.title = "Arrastar cartão"; grip.setAttribute("aria-label", `Mover ${titleFor(card)}`);
+      card.appendChild(grip);
+    }
+    if (!card.querySelector(".free-card-delete")) {
+      const removeButton = document.createElement("button");
+      removeButton.type = "button";
+      removeButton.className = "free-card-delete";
+      removeButton.textContent = "×";
+      removeButton.title = `Excluir card: ${titleFor(card)}`;
+      removeButton.setAttribute("aria-label", `Excluir card ${titleFor(card)}`);
+      card.appendChild(removeButton);
+      removeButton.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        if (!isPanelLayoutEditing()) return;
+        const title = (titleNodeFor(card)?.textContent || titleFor(card)).trim();
+        if (!window.PanelUX && !window.confirm(`Excluir o card "${title}" deste painel? Você poderá restaurá-lo pelo botão Restaurar cards excluídos.`)) return;
+        const store = `painel-hidden-cards:${storageName}`;
+        const readHidden = () => { try { return JSON.parse(localStorage.getItem(store) || "[]") || []; } catch { return []; } };
+        const hidden = readHidden();
+        if (!hidden.includes(key)) hidden.push(key);
+        localStorage.setItem(store, JSON.stringify(hidden));
+        card.style.display = "none";
+        settle(); persist(); resizeCanvas();   // os demais sobem e fecham o vazio
+        if (window.PanelUX) PanelUX.toast(`Card "${title}" excluído`, { action: "Desfazer", onAction: () => {
+          localStorage.setItem(store, JSON.stringify(readHidden().filter(k => k !== key)));
+          card.style.display = "";
+          if (window.PanelNoOverlap) reflow(card, snapshot());   // devolve o card e abre espaço
+          settle(); persist(); resizeCanvas();
+        } });
+      });
+    }
+    if (!card.querySelector(".free-card-rename")) {
+      const renameButton = document.createElement("button");
+      renameButton.type = "button"; renameButton.className = "free-card-rename"; renameButton.textContent = "✎";
+      renameButton.title = `Renomear card: ${titleFor(card)}`;
+      renameButton.setAttribute("aria-label", `Renomear card ${titleFor(card)}`);
+      card.appendChild(renameButton);
+      renameButton.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); if (isPanelLayoutEditing()) startRename(card); });
+    }
+    const nameNode = titleNodeFor(card);
+    if (nameNode && !nameNode.dataset.renameBound) {
+      nameNode.dataset.renameBound = "1";
+      nameNode.addEventListener("dblclick", e => { if (isPanelLayoutEditing() && !e.target.closest("input")) { e.preventDefault(); startRename(card); } });
+    }
+    let tools = card.querySelector(":scope > .free-card-tools");
+    if (!tools) { tools = document.createElement("div"); tools.className = "free-card-tools"; card.appendChild(tools); }
+    for (const cls of [".free-card-rename", ".free-card-grip", ".free-card-delete"]) {
+      const control = card.querySelector(cls);
+      if (control && control.parentElement !== tools) tools.appendChild(control);
+    }
+    const dragHandles = [card.querySelector(".free-card-grip"), card.querySelector(":scope > header"), card.querySelector(":scope > h3"), card.querySelector(":scope > .label")].filter(Boolean);
+    if (!card.dataset.freeDragBound) {
+      card.dataset.freeDragBound = "1";
+      for (const handle of dragHandles) {
+        handle.style.cursor = isPanelLayoutEditing() ? "grab" : "default";
+        handle.style.userSelect = "none";
+        handle.addEventListener("pointerdown", e => {
+          if (!isPanelLayoutEditing() || e.button !== 0 || e.target.closest("input,select,textarea,a,button:not(.free-card-grip)")) return;
+          const start = { x: e.clientX, y: e.clientY, left: parseFloat(card.style.left) || 0, top: parseFloat(card.style.top) || 0, pointerId: e.pointerId };
+          card.style.zIndex = String(++maxZ); card.classList.add("free-card-moving");
+          if (window.PanelNoOverlap) { dragBase = snapshot(); parent.classList.add("free-reflowing"); }
+          e.preventDefault();
+          const move = ev => {
+            if (ev.pointerId !== start.pointerId) return;
+            const snapped = snapFreePosition(card, Math.max(0, start.left + ev.clientX - start.x), Math.max(0, start.top + ev.clientY - start.y));
+            card.style.left = `${snapped.x}px`;
+            card.style.top = `${snapped.y}px`;
+            if (window.PanelNoOverlap && dragBase) reflow(card, dragBase);
+            resizeCanvas();
+          };
+          const finish = ev => {
+            if (ev.pointerId !== start.pointerId) return;
+            document.removeEventListener("pointermove", move);
+            document.removeEventListener("pointerup", finish);
+            document.removeEventListener("pointercancel", finish);
+            card.classList.remove("free-card-moving");
+            settle();
+            hideGuides(); persist(); resizeCanvas();
+          };
+          document.addEventListener("pointermove", move);
+          document.addEventListener("pointerup", finish);
+          document.addEventListener("pointercancel", finish);
+        });
+      }
+    }
+    if (!card.dataset.freeResizeDetectBound) {
+      card.dataset.freeResizeDetectBound = "1";
+      card.addEventListener("pointerdown", e => {
+        if (!isPanelLayoutEditing()) return;
+        const rect = card.getBoundingClientRect();
+        if (e.clientX >= rect.right - 22 && e.clientY >= rect.bottom - 22) { card.dataset.freeResizing = "1"; card._startSize = { w: card.offsetWidth, h: card.offsetHeight }; if (window.PanelNoOverlap) { resizeBase = snapshot(); parent.classList.add("free-reflowing"); } }
+      });
+    }
+    if (!card._freeCardResizeObserver && typeof ResizeObserver !== "undefined") {
+      card._freeCardResizeObserver = new ResizeObserver(() => {
+        if (!card.isConnected) return;
+        snapFreeSize(card);
+        if (window.PanelNoOverlap && isPanelLayoutEditing() && resizeBase && card.dataset.freeResizing === "1") reflow(card, resizeBase);
+        resizeCanvas();
+        clearTimeout(card._freeSaveTimer);
+        card._freeSaveTimer = setTimeout(persist, 150);
+      });
+      card._freeCardResizeObserver.observe(card);
+    }
+  }
+  resizeCanvas();
+  persist();
+}
+
+/* ---------- Tela ---------- */
+function matchesFilter(s) {
+  if (statusFilter === "all") return true;
+  if (statusFilter === "problems") return s.problems.count > 0;
+  if (statusFilter === "collection") return collectionIssues(s).length > 0;
+  return s.status === statusFilter;
+}
+
+function render() {
+  renderStats(hosts);
+  renderRanks(hosts);
+  const content = document.getElementById("content");
+  if (!hosts.length) {
+    content.replaceChildren(h("p", { class: "empty" }, "Nenhum host encontrado. Confira SERVER_GROUPS e WORKSTATION_GROUPS no servidor."));
+    return;
+  }
+  const q = query.trim().toLowerCase();
+  const list = VIEW.cards ? hosts : hosts.filter(s => (!q || s.name.toLowerCase().includes(q)) && matchesFilter(s));
+  if (!list.length) { content.replaceChildren(h("p", { class: "empty" }, "Nenhum host com esses filtros.")); return; }
+  content.replaceChildren(...(VIEW.cards ? [severityControls(), renderCards(list)] : [renderTable(list)]));
+  if (VIEW.cards) {
+    const serverCards = content.querySelector(":scope > .cards");
+    if (serverCards) freeCardLayout(serverCards, ".srv", `hosts-${viewKey}-servers`, { minWidth: 250, minHeight: 170 });
+  }
+}
+
+async function refresh() {
+  if (isPanelLayoutEditing()) return;
+  const revision = panelDataRevision;
+  const banner = document.getElementById("banner");
+  try {
+    const res = await fetch(`/api/hosts?kind=${VIEW.kind}`);
+    if (isPanelLayoutEditing() || revision !== panelDataRevision) return;
+    if (!res.ok) throw new Error((await res.json()).detail || res.status);
+    const data = await res.json();
+    if (isPanelLayoutEditing() || revision !== panelDataRevision) return;
+    hosts = data.hosts;
+    availHours = data.avail_hours || 24;
+    staleSeconds = data.stale_seconds || 900;
+    lastOk = new Date(data.updated);
+    banner.hidden = !data.mock;
+    if (data.mock) banner.textContent = "Dados de demonstração. Configure a conexão com o Zabbix para ver os hosts reais.";
+    document.getElementById("updated").textContent = "Atualizado às " + lastOk.toLocaleTimeString("pt-BR");
+    render();
+  } catch (err) {
+    if (isPanelLayoutEditing() || revision !== panelDataRevision) return;
+    banner.hidden = false;
+    banner.textContent = `${err.message || err}. ` + (lastOk ? `Mostrando os dados das ${lastOk.toLocaleTimeString("pt-BR")}.` : "");
+  }
+}
+
+document.title = VIEW.title;
+document.getElementById("title").textContent = VIEW.title;
+document.querySelector(`.nav a[data-view="${viewKey}"]`).setAttribute("aria-current", "page");
+if (!VIEW.cards) {
+  document.getElementById("tools").hidden = false;
+  document.getElementById("q").addEventListener("input", e => { query = e.target.value; render(); });
+  document.getElementById("f").addEventListener("change", e => { statusFilter = e.target.value; render(); });
+}
+window.addEventListener("resize", () => {
+  const board = document.getElementById("ranks");
+  if (!board) return;
+  const available = Math.max(280, board.clientWidth || (window.innerWidth - 80));
+  rankSettings.forEach(settings => {
+    settings.w = Math.min(Number(settings.w) || 320, available);
+    settings.x = Math.max(0, Math.min(Number(settings.x) || 0, available - settings.w));
+  });
+  persistRankLayout();
+  renderRanks(hosts);
+});
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

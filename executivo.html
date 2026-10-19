@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="color-scheme" content="dark"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Painel Executivo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;600&family=Barlow+Condensed:wght@500;600&display=swap">
+<link rel="stylesheet" href="/static/ui.css">
+<style>
+.grid{position:relative;display:block;width:100%;min-height:190px;margin-top:22px}
+.grid,.alert-config-panel,.links{max-width:1100px;margin-left:auto;margin-right:auto}
+.page-top h1+p,.page-top p{margin:2px 0 0;font-size:13px}.page-top .exec-actions{margin-left:auto}
+</style></head><body><main>
+<header class="page-top"><div><h1>Painel Executivo</h1><p>Resumo operacional do monitoramento de infraestrutura.</p></div><nav class="nav" aria-label="Painéis"><a href="/">Switches</a><a href="/hosts.html?view=servers">Servidores</a><a href="/hosts.html?view=workstations">Computadores</a><a href="/hosts.html?view=all">Todos os hosts</a><a href="/rede.html">Rede</a><a href="/executivo.html" aria-current="page">Executivo</a><a href="/configuracao.html">Configuração</a></nav><div class="exec-actions"><button class="layout-edit-toggle" id="layout-edit-toggle" type="button" aria-pressed="false">Editar painel</button></div></header>
+<div class="grid">
+<section class="card"><div class="label">Switches monitorados pela API</div><div id="switches" class="value">—</div><p>Quantidade de equipamentos retornados pelo painel de switches.</p></section>
+<section class="card"><div class="label">Estado da API do painel</div><div id="api" class="value">Consultando…</div><p>Verificação da disponibilidade do endpoint.</p></section>
+<section class="card"><div class="label">Conexão com o Zabbix</div><div id="zabbix" class="value">Verificando…</div><p id="zabbix-detail">Estado da configuração.</p></section>
+</div>
+
+<section class="alert-config-panel" id="alert-config-panel" aria-labelledby="alerts-title">
+  <div class="alert-panel-heading">
+    <div><h2 id="alerts-title">Central de alertas</h2><p>Notifique os responsáveis quando surgirem problemas no Zabbix, por e-mail e/ou Telegram.</p></div>
+    <span id="alerts-status-pill" class="alert-status-pill">Carregando configuração…</span>
+  </div>
+  <label class="alert-global-toggle alert-check"><input id="alert-monitor-enabled" type="checkbox"><span><strong>Ativar monitoramento e envio automático</strong><span class="alert-muted" style="display:block">O painel consulta os problemas ativos do Zabbix e notifica cada evento selecionado uma vez por destinatário.</span></span></label>
+
+  <div class="alert-section">
+    <h3>Quais tipos de host podem gerar alertas?</h3>
+    <p class="sub">Marque um ou mais tipos. A seleção vale para e-mail e Telegram; eventos associados a vários hosts incluirão somente os hosts que correspondem às opções marcadas.</p>
+    <div class="alert-host-grid" style="margin-top:12px;max-width:680px">
+      <label class="alert-check alert-host-option"><input id="alert-host-all" type="checkbox" name="alert-host-type" value="all" checked><span><strong>Todos os hosts</strong></span></label>
+      <label class="alert-check alert-host-option"><input type="checkbox" name="alert-host-type" value="switches"><span>Switches</span></label>
+      <label class="alert-check alert-host-option"><input type="checkbox" name="alert-host-type" value="servers"><span>Servidores</span></label>
+      <label class="alert-check alert-host-option"><input type="checkbox" name="alert-host-type" value="computers"><span>Computadores</span></label>
+      <label class="alert-check alert-host-option"><input type="checkbox" name="alert-host-type" value="network"><span>Rede (roteadores, firewalls, links e dispositivos)</span></label>
+    </div>
+  </div>
+
+  <div class="alert-section">
+    <h3>Quais alertas devem disparar notificações?</h3><p class="sub">Marque as severidades que devem ser encaminhadas. Por padrão, Alta e Desastre estão selecionadas.</p>
+    <div class="alert-severity-grid">
+      <label class="alert-severity"><input type="checkbox" name="alert-severity" value="0"><span class="sev-dot" style="--sev-color:#8b929e"></span>Não classificado</label>
+      <label class="alert-severity"><input type="checkbox" name="alert-severity" value="1"><span class="sev-dot" style="--sev-color:#6c9de8"></span>Informação</label>
+      <label class="alert-severity"><input type="checkbox" name="alert-severity" value="2"><span class="sev-dot" style="--sev-color:#f5d35e"></span>Aviso</label>
+      <label class="alert-severity"><input type="checkbox" name="alert-severity" value="3"><span class="sev-dot" style="--sev-color:#ff9f43"></span>Média</label>
+      <label class="alert-severity"><input type="checkbox" name="alert-severity" value="4" checked><span class="sev-dot" style="--sev-color:#f87171"></span>Alta</label>
+      <label class="alert-severity"><input type="checkbox" name="alert-severity" value="5" checked><span class="sev-dot" style="--sev-color:#d946ef"></span>Desastre</label>
+    </div>
+    <div class="alert-fields" style="margin-top:14px;max-width:360px">
+      <div class="alert-field"><label for="alert-interval">Verificar a cada</label><select id="alert-interval"><option value="15">15 segundos</option><option value="30">30 segundos</option><option value="60" selected>1 minuto</option><option value="120">2 minutos</option><option value="300">5 minutos</option><option value="600">10 minutos</option></select></div>
+    </div>
+  </div>
+
+  <div class="alert-section">
+    <div class="alert-channel-grid">
+      <section class="alert-channel" aria-labelledby="email-alert-heading">
+        <div class="alert-channel-head"><h3 id="email-alert-heading">E-mail</h3><label class="alert-check"><input id="alert-email-enabled" type="checkbox"><span>Ativar</span></label></div>
+        <div class="alert-fields">
+          <div class="alert-field full"><label for="alert-email-recipients">Grupo de e-mail / destinatários</label><textarea id="alert-email-recipients" placeholder="infra@empresa.com.br, suporte@empresa.com.br" autocomplete="off"></textarea><span class="alert-muted">Aceita vários endereços separados por vírgula ou quebra de linha.</span></div>
+          <div class="alert-field"><label for="alert-smtp-host">Servidor SMTP</label><input id="alert-smtp-host" placeholder="smtp.office365.com" autocomplete="off"><span class="alert-muted">Microsoft 365 Exchange Online: use smtp.office365.com, porta 587 e STARTTLS. Não use o MX de recebimento como servidor de envio autenticado.</span></div>
+          <div class="alert-field"><label for="alert-smtp-port">Porta</label><input id="alert-smtp-port" type="number" min="1" max="65535" value="587"></div>
+          <div class="alert-field"><label for="alert-smtp-security">Segurança</label><select id="alert-smtp-security"><option value="starttls">STARTTLS (587)</option><option value="ssl">SSL/TLS (465)</option><option value="none">Sem criptografia</option></select></div>
+          <div class="alert-field"><label for="alert-smtp-from">E-mail remetente</label><input id="alert-smtp-from" type="email" placeholder="monitoramento@empresa.com.br" autocomplete="off"></div>
+          <div class="alert-field full"><label for="alert-smtp-user">Usuário SMTP (se necessário)</label><input id="alert-smtp-user" autocomplete="username" placeholder="Usuário de autenticação"></div>
+          <div class="alert-field full"><label for="alert-smtp-pass">Senha SMTP</label><input id="alert-smtp-pass" type="password" autocomplete="new-password" placeholder="Senha não configurada"><span class="alert-muted" id="alert-smtp-pass-hint">Deixe em branco para manter a senha já salva.</span></div>
+        </div>
+      </section>
+      <section class="alert-channel" aria-labelledby="telegram-alert-heading">
+        <div class="alert-channel-head"><h3 id="telegram-alert-heading">Telegram</h3><label class="alert-check"><input id="alert-telegram-enabled" type="checkbox"><span>Ativar</span></label></div>
+        <div class="alert-fields">
+          <div class="alert-field full"><label for="alert-telegram-token">Token do bot</label><input id="alert-telegram-token" type="password" autocomplete="new-password" placeholder="Token fornecido pelo BotFather"><span id="alert-telegram-token-hint" class="alert-muted">Crie um bot pelo @BotFather e informe o token.</span></div>
+          <div class="alert-field full"><label for="alert-telegram-chatids">Grupo(s) ou chat ID(s) do Telegram</label><textarea id="alert-telegram-chatids" placeholder="-1001234567890, -1009876543210" autocomplete="off"></textarea><span class="alert-muted">Separe vários IDs por vírgula ou quebra de linha. Adicione o bot ao grupo e permita que ele envie mensagens.</span></div>
+          <div class="alert-field full"><p class="alert-muted">Dica: IDs de grupos costumam começar com sinal de menos. O bot precisa estar no grupo para publicar.</p></div>
+        </div>
+      </section>
+    </div>
+  </div>
+  <div class="alert-actions">
+    <button class="alert-button primary" id="alert-save-btn" type="button">Salvar configuração</button>
+    <button class="alert-button" id="alert-test-btn" type="button">Salvar e enviar teste</button>
+  </div>
+  <p id="alert-feedback" role="status" aria-live="polite"></p>
+  <div class="alert-runtime" id="alert-runtime">O monitor de alertas será iniciado pelo serviço do painel.</div>
+</section>
+
+<div class="links"><a href="/hosts.html">Hosts</a><a href="/rede.html">Rede</a><a href="/configuracao.html">Configuração da conexão</a><a href="/docs">Documentação da API</a></div>
+<script src="/static/no-overlap.js"></script>
+<script src="/static/edit-ux.js"></script>
+<script>
+/* Edição de layout: mover/redimensionar e alterar leituras só ficam liberados ao clicar em Editar painel. */
+function isPanelLayoutEditing() { return document.body.classList.contains("layout-edit-active"); }
+function setupPanelEditMode() {
+  const button = document.getElementById("layout-edit-toggle");
+  if (!button || button.dataset.bound) return;
+  button.dataset.bound = "1";
+  let restoreButton = document.getElementById("restore-hidden-cards");
+  if (!restoreButton) {
+    restoreButton = document.createElement("button");
+    restoreButton.id = "restore-hidden-cards";
+    restoreButton.type = "button";
+    restoreButton.className = "layout-edit-toggle";
+    restoreButton.textContent = "Restaurar cards excluídos";
+    restoreButton.title = "Restaurar todos os cards ocultados nesta página";
+    restoreButton.hidden = true;
+    button.insertAdjacentElement("afterend", restoreButton);
+    restoreButton.addEventListener("click", () => {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith("painel-hidden-cards:")) localStorage.removeItem(key);
+      }
+      window.location.reload();
+    });
+  }
+  const setMode = enabled => {
+    restoreButton.hidden = !enabled;
+    document.body.classList.toggle("layout-edit-active", enabled);
+    button.setAttribute("aria-pressed", String(enabled));
+    button.textContent = enabled ? "Concluir edição" : "Editar painel";
+    button.title = enabled ? "Salvar o layout e sair do modo de edição" : "Liberar ajustes de layout e configuração dos itens Zabbix";
+    document.querySelectorAll(".free-card-managed").forEach(card => {
+      card.style.resize = enabled ? "both" : "none";
+      card.querySelectorAll(":scope > header, :scope > h3, :scope > .label").forEach(handle => { handle.style.cursor = enabled ? "grab" : "default"; });
+    });
+    document.querySelectorAll(".rank").forEach(card => { card.style.resize = enabled ? "both" : "none"; });
+    document.querySelectorAll(".rank-head").forEach(handle => { handle.style.cursor = enabled ? "grab" : "default"; handle.style.touchAction = enabled ? "none" : "auto"; });
+    if (!enabled) {
+      document.querySelectorAll(".rank-config").forEach(config => { config.hidden = true; });
+      document.querySelectorAll(".rank-menu-btn").forEach(menu => menu.setAttribute("aria-expanded", "false"));
+      document.querySelectorAll(".free-alignment-guide").forEach(guide => { guide.style.display = "none"; });
+    }
+    window.dispatchEvent(new CustomEvent("panel-layout-edit-change", { detail: { enabled } }));
+  };
+  button.addEventListener("click", () => setMode(!isPanelLayoutEditing()));
+  setMode(false);
+}
+setupPanelEditMode();
+
+function ensureFreeAlignmentGuides(parent) {
+  let vertical = parent.querySelector(":scope > .free-alignment-guide.vertical");
+  let horizontal = parent.querySelector(":scope > .free-alignment-guide.horizontal");
+  if (!vertical) { vertical = document.createElement("div"); vertical.className = "free-alignment-guide vertical"; vertical.setAttribute("aria-hidden", "true"); parent.appendChild(vertical); }
+  if (!horizontal) { horizontal = document.createElement("div"); horizontal.className = "free-alignment-guide horizontal"; horizontal.setAttribute("aria-hidden", "true"); parent.appendChild(horizontal); }
+  return { vertical, horizontal };
+}
+
+/* Layout livre comum: cartões podem ser movidos e redimensionados com o mouse.
+   Cada área salva suas coordenadas no navegador e restaura-as após a atualização. */
+function freeCardLayout(parentOrSelector, selector, storageName, options = {}) {
+  const parent = typeof parentOrSelector === "string" ? document.querySelector(parentOrSelector) : parentOrSelector;
+  if (!parent) return;
+  const cards = [...parent.querySelectorAll(`:scope > ${selector}`)];
+  if (!cards.length) return;
+  const gap = options.gap ?? 14;
+  const baseMinW = options.minWidth ?? 220;
+  // Largura mínima efetiva: a grade "N por linha" pode reduzi-la (guardado por grupo) para caber mais cards por linha.
+  try { parent._freeMinW = Number(localStorage.getItem(`painel-card-minw:${storageName}`)) || 0; } catch { parent._freeMinW = 0; }
+  const minW = () => Math.min(baseMinW, parent._freeMinW || baseMinW);
+  const minH = options.minHeight ?? 110;
+  const available = Math.max(320, parent.clientWidth || (window.innerWidth - 80));
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(`painel-free-cards:${storageName}`) || "{}") || {}; } catch {}
+  let hiddenCards = [];
+  try { hiddenCards = JSON.parse(localStorage.getItem(`painel-hidden-cards:${storageName}`) || "[]") || []; } catch {}
+  for (const card of cards) {
+    const titleNode = card.querySelector(":scope > header h2, :scope > h2, :scope > h3, :scope > .label, :scope > span, h2, h3, .label");
+    const title = card.dataset.freeOrigTitle || (titleNode?.textContent || card.className || "card").trim().replace(/\s+/g, " ").slice(0, 140);
+    const key = `${[...card.classList].filter(c => !["online", "offline", "unknown", "moving", "free-card-moving"].includes(c)).sort().join(".")}:${title}`;
+    if (hiddenCards.includes(key)) card.style.display = "none";
+  }
+  const visibleCards = cards.filter(card => card.style.display !== "none");
+  if (!visibleCards.length) {
+    parent.style.position = "relative"; parent.style.minHeight = "40px";
+    parent.dataset.freeStorageName = storageName;
+    return;
+  }
+  parent.style.position = "relative";
+  parent.style.display = "block";
+  parent.style.width = "100%";
+  parent.style.minHeight = `${minH}px`;
+  parent.style.overflow = "visible";
+
+  // Título exibido pode ser personalizado pelo usuário; a CHAVE de layout usa sempre o título original
+  // (dataset.freeOrigTitle), para que renomear nunca perca posição/tamanho salvos.
+  const titleNodeFor = card => [
+    card.querySelector(":scope > header h2"), card.querySelector(":scope > h2"),
+    card.querySelector(":scope > h3"), card.querySelector(":scope > .label"),
+    card.querySelector(":scope > span"), card.querySelector("h2"), card.querySelector("h3"),
+    card.querySelector(".label")
+  ].find(n => n && n.textContent.trim());
+  const titleFor = card => card.dataset.freeOrigTitle ||
+    (titleNodeFor(card)?.textContent || card.className || "card").trim().replace(/\s+/g, " ").slice(0, 140);
+  const nameStore = `painel-card-names:${storageName}`;
+  const readNames = () => { try { return JSON.parse(localStorage.getItem(nameStore) || "{}") || {}; } catch { return {}; } };
+  const writeName = (key, value) => {
+    const names = readNames(); if (value) names[key] = value; else delete names[key];
+    try { localStorage.setItem(nameStore, JSON.stringify(names)); } catch {}
+  };
+  const applyCustomName = (card, key) => {
+    const name = readNames()[key], node = titleNodeFor(card);
+    if (!name || !node) return;
+    if (!card.dataset.freeOrigTitle) card.dataset.freeOrigTitle = titleFor(card);
+    node.textContent = name;
+  };
+  // Edição inline do nome: Enter/clique fora salva, Esc cancela, vazio restaura o nome original.
+  const startRename = card => {
+    const node = titleNodeFor(card);
+    if (!node || node.querySelector("input")) return;
+    const key = card.dataset.freeCardKey, shown = node.textContent.trim(), orig = card.dataset.freeOrigTitle || shown;
+    const input = document.createElement("input");
+    input.type = "text"; input.className = "free-card-name-input"; input.value = shown; input.maxLength = 60;
+    input.setAttribute("aria-label", "Nome do card (deixe vazio para restaurar o original)");
+    node.textContent = ""; node.appendChild(input); input.focus(); input.select();
+    let finished = false;
+    const finish = save => {
+      if (finished) return; finished = true;
+      const value = input.value.trim().replace(/\s+/g, " ");
+      if (!save) { node.textContent = shown; return; }
+      if (!value || value === orig) { writeName(key, ""); delete card.dataset.freeOrigTitle; node.textContent = orig; }
+      else { writeName(key, value); card.dataset.freeOrigTitle = orig; node.textContent = value; }
+    };
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); finish(true); } else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+      e.stopPropagation();
+    });
+    input.addEventListener("blur", () => finish(true));
+  };
+  const keyFor = card => `${[...card.classList].filter(c => !["online", "offline", "unknown", "moving", "free-card-moving"].includes(c)).sort().join(".")}:${titleFor(card)}`;
+  const widthFor = card => {
+    if (typeof options.widthFor === "function") return Math.max(minW(), Math.min(available, options.widthFor(card, available)));
+    if (card.classList.contains("stat")) return Math.min(210, Math.max(150, (available - gap * 3) / 4));
+    if (card.classList.contains("switch")) return Math.max(420, Math.min(960, available - 28));
+    if (card.classList.contains("rank")) return Math.max(300, Math.min(450, (available - gap) / 2));
+    return Math.max(minW(), Math.min(360, available - gap));
+  };
+  const heightFor = card => {
+    if (typeof options.heightFor === "function") return options.heightFor(card);
+    if (card.classList.contains("stat")) return 86;
+    if (card.classList.contains("switch")) return 175;
+    if (card.classList.contains("rank")) return 220;
+    if (card.classList.contains("card")) return 175;
+    return 230;
+  };
+  const items = visibleCards.map((card, i) => {
+    const key = keyFor(card);
+    card.dataset.freeCardKey = key;
+    applyCustomName(card, key);
+    const record = saved[key] && Number.isFinite(Number(saved[key].x)) ? saved[key] : null;
+    card.style.position = "absolute";
+    card.style.boxSizing = "border-box";
+    card.style.margin = "0";
+    card.style.maxWidth = "none";
+    card.style.maxHeight = "none";
+    card.style.minWidth = `${minW()}px`;
+    card.style.minHeight = `${minH}px`;
+    card.classList.add("free-card-managed");
+    card.style.resize = isPanelLayoutEditing() ? "both" : "none";
+    card.style.overflow = "auto";
+    card.style.touchAction = "auto";
+    card.style.width = `${Math.max(minW(), Number(record?.w) || widthFor(card))}px`;
+    card.style.height = record?.h ? `${Math.max(minH, Number(record.h))}px` : "auto";
+    card.style.left = `${Math.max(0, Number(record?.x) || 0)}px`;
+    card.style.top = `${Math.max(0, Number(record?.y) || 0)}px`;
+    card.style.zIndex = String(Number(record?.z) || (100 + i));
+    card.style.cursor = "default";
+    return { card, key, record, index: i };
+  });
+
+  const anySaved = items.some(x => x.record);
+  if (!anySaved) {
+    let x = 0, y = 0, rowHeight = 0;
+    for (const item of items) {
+      const w = widthFor(item.card);
+      item.card.style.width = `${w}px`;
+      item.card.style.height = "auto";
+      if (x > 0 && x + w > available) { x = 0; y += rowHeight + gap; rowHeight = 0; }
+      item.card.style.left = `${x}px`; item.card.style.top = `${y}px`;
+      const h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+      item.card.style.height = `${h}px`;
+      item.record = { x, y, w, h, z: 100 + item.index };
+      rowHeight = Math.max(rowHeight, h); x += w + gap;
+    }
+  } else {
+    let bottom = 0;
+    for (const item of items) if (item.record) bottom = Math.max(bottom, Number(item.record.y || 0) + Number(item.record.h || item.card.offsetHeight || minH));
+    for (const item of items) {
+      if (!item.record) {
+        const w = widthFor(item.card), h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+        item.record = { x: 0, y: bottom + gap, w, h, z: 100 + item.index };
+        item.card.style.left = "0px"; item.card.style.top = `${item.record.y}px`;
+        item.card.style.width = `${w}px`; item.card.style.height = `${h}px`;
+        bottom += h + gap;
+      } else if (!item.record.h) {
+        item.record.h = Math.max(minH, item.card.offsetHeight || heightFor(item.card));
+        item.card.style.height = `${item.record.h}px`;
+      }
+    }
+  }
+
+  // Anti-sobreposição (estilo Sortable): ao arrastar/redimensionar, os outros cards abrem espaço (empurrados para
+  // baixo a partir da posição que tinham no início do gesto); ao soltar, o layout é compactado e preenche os vazios.
+  const rectOf = card => ({ x: parseFloat(card.style.left) || 0, y: parseFloat(card.style.top) || 0, w: card.offsetWidth, h: card.offsetHeight });
+  const snapshot = () => items.filter(i => i.card.style.display !== "none").map(i => ({ card: i.card, ...rectOf(i.card) }));
+  let dragBase = null, resizeBase = null, ghost = null;
+  const reflow = (moving, base) => {
+    const others = base.filter(b => b.card !== moving);
+    const pos = PanelNoOverlap.push(rectOf(moving), others);
+    others.forEach((o, i) => { o.card.style.left = `${pos[i].x}px`; o.card.style.top = `${pos[i].y}px`; });
+    // Espaço-fantasma: onde o card vai assentar quando for solto (após compactar).
+    const mine = rectOf(moving);
+    const dest = PanelNoOverlap.compact([mine, ...others.map((o, i) => ({ x: pos[i].x, y: pos[i].y, w: o.w, h: o.h }))])[0];
+    if (!ghost) { ghost = document.createElement("div"); ghost.className = "free-drop-ghost"; parent.appendChild(ghost); }
+    Object.assign(ghost.style, { left: `${dest.x}px`, top: `${dest.y}px`, width: `${mine.w}px`, height: `${mine.h}px` });
+    resizeCanvas();
+  };
+  const settle = () => {
+    if (window.PanelNoOverlap) {
+      const list = snapshot(), pos = PanelNoOverlap.compact(list);
+      list.forEach((o, i) => { o.card.style.left = `${pos[i].x}px`; o.card.style.top = `${pos[i].y}px`; });
+    }
+    dragBase = null; resizeBase = null; parent.classList.remove("free-reflowing");
+    if (ghost) { ghost.remove(); ghost = null; }
+    resizeCanvas();
+  };
+  // Assistente: após redimensionar um card, sugere padronizar o grupo (mesmo tamanho ou N por linha, alinhado). Com Desfazer.
+  const suggestLayout = card => {
+    if (!window.PanelUX?.suggestLayout || !window.PanelNoOverlap) return;
+    const count = snapshot().length;
+    if (count < 2) return;
+    const size = { w: Math.round(card.offsetWidth), h: Math.round(card.offsetHeight) };
+    const width = parent.clientWidth || available;
+    const cwFor = n => Math.floor((width - gap * (n - 1)) / n);
+    const minKey = `painel-card-minw:${storageName}`;
+    const apply = (build, undoExtra) => {
+      const list = snapshot();
+      const prev = list.map(o => ({ card: o.card, left: o.card.style.left, top: o.card.style.top, width: o.card.style.width, height: o.card.style.height }));
+      build(list).forEach((r, i) => {
+        const el = list[i].card;
+        el.style.left = `${r.x}px`; el.style.top = `${r.y}px`; el.style.width = `${r.w}px`; el.style.height = `${r.h}px`;
+      });
+      settle(); persist(); resizeCanvas();
+      PanelUX.toast(`Layout aplicado a ${count} cards`, { action: "Desfazer", onAction: () => {
+        if (undoExtra) undoExtra();
+        prev.forEach(p => Object.assign(p.card.style, { left: p.left, top: p.top, width: p.width, height: p.height }));
+        settle(); persist(); resizeCanvas();
+      } });
+    };
+    PanelUX.suggestLayout({
+      count, sizeLabel: `${size.w}×${size.h}`,
+      maxPerRow: count,
+      tightFrom: (() => { for (let n = 1; n <= count; n++) if (cwFor(n) < baseMinW) return n; return Infinity; })(),
+      minOk: n => cwFor(n) >= 80,
+      onSameSize: () => apply(list => {
+        const sized = list.map(o => ({ x: o.x, y: o.y, w: size.w, h: size.h }));
+        const pos = PanelNoOverlap.flow(sized, width);
+        return sized.map((o, i) => ({ x: pos[i].x, y: pos[i].y, w: size.w, h: size.h }));
+      }),
+      onGrid: n => {
+        // Se a coluna ficar mais estreita que o mínimo padrão, reduz o mínimo do grupo (e guarda) para o layout não sobrepor.
+        const prevMin = parent._freeMinW || 0, setMin = v => {
+          parent._freeMinW = v;
+          try { v ? localStorage.setItem(minKey, String(v)) : localStorage.removeItem(minKey); } catch {}
+          snapshot().forEach(o => { o.card.style.minWidth = `${minW()}px`; });
+        };
+        setMin(cwFor(n) < baseMinW ? cwFor(n) : 0);
+        apply(list => PanelNoOverlap.gridLayout(list, n, width, gap), () => setMin(prevMin));
+      }
+    });
+  };
+  if (window.PanelNoOverlap) {
+    // Layout salvo/inicial com cards sobrepostos é reorganizado ao abrir (empurra para baixo).
+    const placed = [];
+    [...items].sort((a, b) => rectOf(a.card).y - rectOf(b.card).y || rectOf(a.card).x - rectOf(b.card).x).forEach(({ card }) => {
+      const r = rectOf(card), f = PanelNoOverlap.resolve(r, placed, available);
+      card.style.left = `${f.x}px`; card.style.top = `${f.y}px`;
+      placed.push({ x: f.x, y: f.y, w: r.w, h: r.h });
+    });
+  }
+  let maxZ = Math.max(100, ...items.map(x => Number(x.record?.z) || 100));
+  const persist = () => {
+    const out = {};
+    for (const { card, key } of items) out[key] = {
+      x: Math.max(0, Math.round(parseFloat(card.style.left) || 0)),
+      y: Math.max(0, Math.round(parseFloat(card.style.top) || 0)),
+      w: Math.max(minW(), Math.round(card.offsetWidth)),
+      h: Math.max(minH, Math.round(card.offsetHeight)),
+      z: Number(card.style.zIndex) || 100
+    };
+    try { localStorage.setItem(`painel-free-cards:${storageName}`, JSON.stringify({ ...saved, ...out })); } catch {}
+  };
+  if (parent._freeCardLayoutContext) parent._freeCardLayoutContext.persist = persist;
+  const resizeCanvas = () => {
+    let bottom = 0;
+    for (const {card} of items) bottom = Math.max(bottom, (parseFloat(card.style.top) || 0) + card.offsetHeight);
+    parent.style.height = `${Math.max(minH, bottom + gap)}px`;
+  };
+  const guides = ensureFreeAlignmentGuides(parent);
+  const hideGuides = () => { guides.vertical.style.display = "none"; guides.horizontal.style.display = "none"; };
+  if (parent._freeCardLayoutContext) { parent._freeCardLayoutContext.items = items; parent._freeCardLayoutContext.hideGuides = hideGuides; parent._freeCardLayoutContext.resizeCanvas = resizeCanvas; }
+  const nearestSnap = (position, size, targets) => {
+    const points = [position, position + size / 2, position + size];
+    let best = null;
+    for (const point of points) for (const target of targets) {
+      const delta = target - point, distance = Math.abs(delta);
+      if (distance <= 8 && (!best || distance < best.distance)) best = { delta, target, distance };
+    }
+    return best;
+  };
+  const snapFreePosition = (card, left, top) => {
+    const others = items.filter(item => item.card !== card).map(({card: other}) => ({
+      x: parseFloat(other.style.left) || 0, y: parseFloat(other.style.top) || 0,
+      w: other.offsetWidth, h: other.offsetHeight
+    }));
+    const xTargets = others.flatMap(o => [o.x, o.x + o.w / 2, o.x + o.w]);
+    const yTargets = others.flatMap(o => [o.y, o.y + o.h / 2, o.y + o.h]);
+    const sx = nearestSnap(left, card.offsetWidth, xTargets);
+    const sy = nearestSnap(top, card.offsetHeight, yTargets);
+    if (sx) { left += sx.delta; guides.vertical.style.left = `${sx.target}px`; guides.vertical.style.display = "block"; }
+    else guides.vertical.style.display = "none";
+    if (sy) { top += sy.delta; guides.horizontal.style.top = `${sy.target}px`; guides.horizontal.style.display = "block"; }
+    else guides.horizontal.style.display = "none";
+    return { x: Math.max(0, left), y: Math.max(0, top) };
+  };
+  const snapFreeSize = card => {
+    if (!isPanelLayoutEditing() || card.dataset.freeResizing !== "1") return;
+    const left = parseFloat(card.style.left) || 0, top = parseFloat(card.style.top) || 0;
+    const others = items.filter(item => item.card !== card).map(({card: other}) => ({
+      x: parseFloat(other.style.left) || 0, y: parseFloat(other.style.top) || 0,
+      w: other.offsetWidth, h: other.offsetHeight
+    }));
+    const xTargets = others.flatMap(o => [o.x, o.x + o.w / 2, o.x + o.w]);
+    const yTargets = others.flatMap(o => [o.y, o.y + o.h / 2, o.y + o.h]);
+    const snapEdge = (edge, targets, origin, minSize) => {
+      let best = null;
+      for (const target of targets) { const d = Math.abs(target - edge); if (d <= 8 && target - origin >= minSize && (!best || d < best.distance)) best = { target, distance: d }; }
+      return best;
+    };
+    const sx = snapEdge(left + card.offsetWidth, xTargets, left, minW());
+    const sy = snapEdge(top + card.offsetHeight, yTargets, top, minH);
+    if (sx) { const w = sx.target - left; if (Math.abs(card.offsetWidth - w) > 1) card.style.width = `${w}px`; guides.vertical.style.left = `${sx.target}px`; guides.vertical.style.display = "block"; }
+    else guides.vertical.style.display = "none";
+    if (sy) { const h = sy.target - top; if (Math.abs(card.offsetHeight - h) > 1) card.style.height = `${h}px`; guides.horizontal.style.top = `${sy.target}px`; guides.horizontal.style.display = "block"; }
+    else guides.horizontal.style.display = "none";
+  };
+  parent._freeCardLayoutContext = { items, persist, resizeCanvas, hideGuides, settle, suggest: suggestLayout };
+  if (!parent.dataset.freeLayoutPointerUpBound) {
+    parent.dataset.freeLayoutPointerUpBound = "1";
+    const finishResize = () => {
+      const ctx = parent._freeCardLayoutContext;
+      if (!ctx) return;
+      let changed = false, resized = null;
+      for (const {card} of ctx.items) if (card.dataset.freeResizing === "1") {
+        delete card.dataset.freeResizing; changed = true;
+        const s0 = card._startSize;
+        if (s0 && (Math.abs(s0.w - card.offsetWidth) > 2 || Math.abs(s0.h - card.offsetHeight) > 2)) resized = card;
+      }
+      if (changed) {
+        ctx.hideGuides(); if (ctx.settle) ctx.settle(); if (ctx.persist) ctx.persist(); ctx.resizeCanvas();
+        if (resized && ctx.suggest) ctx.suggest(resized);
+      }
+    };
+    document.addEventListener("pointerup", finishResize);
+    document.addEventListener("pointercancel", finishResize);
+  }
+  for (const { card, key } of items) {
+    if (!card.querySelector(".free-card-grip")) {
+      const grip = document.createElement("button");
+      grip.type = "button"; grip.className = "free-card-grip"; grip.textContent = "⠿";
+      grip.title = "Arrastar cartão"; grip.setAttribute("aria-label", `Mover ${titleFor(card)}`);
+      card.appendChild(grip);
+    }
+    if (!card.querySelector(".free-card-delete")) {
+      const removeButton = document.createElement("button");
+      removeButton.type = "button";
+      removeButton.className = "free-card-delete";
+      removeButton.textContent = "×";
+      removeButton.title = `Excluir card: ${titleFor(card)}`;
+      removeButton.setAttribute("aria-label", `Excluir card ${titleFor(card)}`);
+      card.appendChild(removeButton);
+      removeButton.addEventListener("click", event => {
+        event.preventDefault(); event.stopPropagation();
+        if (!isPanelLayoutEditing()) return;
+        const title = (titleNodeFor(card)?.textContent || titleFor(card)).trim();
+        if (!window.PanelUX && !window.confirm(`Excluir o card "${title}" deste painel? Você poderá restaurá-lo pelo botão Restaurar cards excluídos.`)) return;
+        const store = `painel-hidden-cards:${storageName}`;
+        const readHidden = () => { try { return JSON.parse(localStorage.getItem(store) || "[]") || []; } catch { return []; } };
+        const hidden = readHidden();
+        if (!hidden.includes(key)) hidden.push(key);
+        localStorage.setItem(store, JSON.stringify(hidden));
+        card.style.display = "none";
+        settle(); persist(); resizeCanvas();   // os demais sobem e fecham o vazio
+        if (window.PanelUX) PanelUX.toast(`Card "${title}" excluído`, { action: "Desfazer", onAction: () => {
+          localStorage.setItem(store, JSON.stringify(readHidden().filter(k => k !== key)));
+          card.style.display = "";
+          if (window.PanelNoOverlap) reflow(card, snapshot());   // devolve o card e abre espaço
+          settle(); persist(); resizeCanvas();
+        } });
+      });
+    }
+    if (!card.querySelector(".free-card-rename")) {
+      const renameButton = document.createElement("button");
+      renameButton.type = "button"; renameButton.className = "free-card-rename"; renameButton.textContent = "✎";
+      renameButton.title = `Renomear card: ${titleFor(card)}`;
+      renameButton.setAttribute("aria-label", `Renomear card ${titleFor(card)}`);
+      card.appendChild(renameButton);
+      renameButton.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); if (isPanelLayoutEditing()) startRename(card); });
+    }
+    const nameNode = titleNodeFor(card);
+    if (nameNode && !nameNode.dataset.renameBound) {
+      nameNode.dataset.renameBound = "1";
+      nameNode.addEventListener("dblclick", e => { if (isPanelLayoutEditing() && !e.target.closest("input")) { e.preventDefault(); startRename(card); } });
+    }
+    let tools = card.querySelector(":scope > .free-card-tools");
+    if (!tools) { tools = document.createElement("div"); tools.className = "free-card-tools"; card.appendChild(tools); }
+    for (const cls of [".free-card-rename", ".free-card-grip", ".free-card-delete"]) {
+      const control = card.querySelector(cls);
+      if (control && control.parentElement !== tools) tools.appendChild(control);
+    }
+    const dragHandles = [card.querySelector(".free-card-grip"), card.querySelector(":scope > header"), card.querySelector(":scope > h3"), card.querySelector(":scope > .label")].filter(Boolean);
+    if (!card.dataset.freeDragBound) {
+      card.dataset.freeDragBound = "1";
+      for (const handle of dragHandles) {
+        handle.style.cursor = isPanelLayoutEditing() ? "grab" : "default";
+        handle.style.userSelect = "none";
+        handle.addEventListener("pointerdown", e => {
+          if (!isPanelLayoutEditing() || e.button !== 0 || e.target.closest("input,select,textarea,a,button:not(.free-card-grip)")) return;
+          const start = { x: e.clientX, y: e.clientY, left: parseFloat(card.style.left) || 0, top: parseFloat(card.style.top) || 0, pointerId: e.pointerId };
+          card.style.zIndex = String(++maxZ); card.classList.add("free-card-moving");
+          if (window.PanelNoOverlap) { dragBase = snapshot(); parent.classList.add("free-reflowing"); }
+          e.preventDefault();
+          const move = ev => {
+            if (ev.pointerId !== start.pointerId) return;
+            const snapped = snapFreePosition(card, Math.max(0, start.left + ev.clientX - start.x), Math.max(0, start.top + ev.clientY - start.y));
+            card.style.left = `${snapped.x}px`;
+            card.style.top = `${snapped.y}px`;
+            if (window.PanelNoOverlap && dragBase) reflow(card, dragBase);
+            resizeCanvas();
+          };
+          const finish = ev => {
+            if (ev.pointerId !== start.pointerId) return;
+            document.removeEventListener("pointermove", move);
+            document.removeEventListener("pointerup", finish);
+            document.removeEventListener("pointercancel", finish);
+            card.classList.remove("free-card-moving");
+            settle();
+            hideGuides(); persist(); resizeCanvas();
+          };
+          document.addEventListener("pointermove", move);
+          document.addEventListener("pointerup", finish);
+          document.addEventListener("pointercancel", finish);
+        });
+      }
+    }
+    if (!card.dataset.freeResizeDetectBound) {
+      card.dataset.freeResizeDetectBound = "1";
+      card.addEventListener("pointerdown", e => {
+        if (!isPanelLayoutEditing()) return;
+        const rect = card.getBoundingClientRect();
+        if (e.clientX >= rect.right - 22 && e.clientY >= rect.bottom - 22) { card.dataset.freeResizing = "1"; card._startSize = { w: card.offsetWidth, h: card.offsetHeight }; if (window.PanelNoOverlap) { resizeBase = snapshot(); parent.classList.add("free-reflowing"); } }
+      });
+    }
+    if (!card._freeCardResizeObserver && typeof ResizeObserver !== "undefined") {
+      card._freeCardResizeObserver = new ResizeObserver(() => {
+        if (!card.isConnected) return;
+        snapFreeSize(card);
+        if (window.PanelNoOverlap && isPanelLayoutEditing() && resizeBase && card.dataset.freeResizing === "1") reflow(card, resizeBase);
+        resizeCanvas();
+        clearTimeout(card._freeSaveTimer);
+        card._freeSaveTimer = setTimeout(persist, 150);
+      });
+      card._freeCardResizeObserver.observe(card);
+    }
+  }
+  resizeCanvas();
+  persist();
+}
+
+freeCardLayout(document.querySelector(".grid"), ".card", "executive-cards", { minWidth: 220, minHeight: 130 });
+let executiveDataRevision = 0;
+async function refreshExecutiveSummary() {
+  if (isPanelLayoutEditing()) return;
+  const revision = executiveDataRevision;
+  try {
+    const r = await fetch('/api/switches');
+    if (isPanelLayoutEditing() || revision !== executiveDataRevision) return;
+    if (!r.ok) throw Error('HTTP ' + r.status);
+    const d = await r.json();
+    if (isPanelLayoutEditing() || revision !== executiveDataRevision) return;
+    $('switches').textContent = Array.isArray(d) ? d.length : (d.items?.length ?? d.total ?? 'Disponível');
+    $('api').textContent = 'Disponível';
+  } catch (e) {
+    if (!isPanelLayoutEditing() && revision === executiveDataRevision) $('api').textContent = 'Indisponível';
+  }
+  try {
+    const r = await fetch('/api/settings');
+    if (isPanelLayoutEditing() || revision !== executiveDataRevision) return;
+    const d = await r.json();
+    if (isPanelLayoutEditing() || revision !== executiveDataRevision) return;
+    $('zabbix').textContent = d.configured ? 'Configurado' : 'Pendente';
+    $('zabbix-detail').textContent = d.configured ? 'URL da API definida.' : 'Acesse Configuração para cadastrar e testar a conexão.';
+  } catch (e) {
+    if (!isPanelLayoutEditing() && revision === executiveDataRevision) $('zabbix').textContent = 'Não verificado';
+  }
+}
+window.addEventListener("panel-layout-edit-change", event => {
+  executiveDataRevision += 1;
+  if (!event.detail?.enabled) {
+    refreshExecutiveSummary();
+    refreshAlertStatus();
+  }
+});
+refreshExecutiveSummary();
+
+async function initAlertConfig() {
+  const bind = (id, prop, transform = v => v) => { const el = $(id); if (el) el[prop] = transform; };
+  const feedback = (message, kind = "") => { const el = $("alert-feedback"); el.textContent = message; el.className = kind; };
+  const setBusy = (busy) => { $("alert-save-btn").disabled = busy; $("alert-test-btn").disabled = busy; };
+  const splitTargets = value => value.split(/[\n,;]+/).map(x => x.trim()).filter(Boolean);
+  const fields = () => ({
+    monitor_enabled: $("alert-monitor-enabled").checked,
+    severity_levels: [...document.querySelectorAll('input[name="alert-severity"]:checked')].map(el => Number(el.value)),
+    // Canonicalize selection explicitly. This avoids saving both "all" and specific categories
+    // if the browser retained a stale checked state while the form was loading.
+    host_type_filters: (() => {
+      const all = $("alert-host-all");
+      const selected = [...document.querySelectorAll('input[name="alert-host-type"]:checked')]
+        .filter(el => el.value !== "all")
+        .map(el => el.value);
+      return (all?.checked || selected.length === 0) ? ["all"] : [...new Set(selected)];
+    })(),
+    interval_seconds: Number($("alert-interval").value || 60),
+    email_enabled: $("alert-email-enabled").checked,
+    email_smtp_host: $("alert-smtp-host").value.trim(),
+    email_smtp_port: Number($("alert-smtp-port").value || 587),
+    email_security: $("alert-smtp-security").value,
+    email_username: $("alert-smtp-user").value.trim(),
+    email_password: $("alert-smtp-pass").value,
+    email_from: $("alert-smtp-from").value.trim(),
+    email_recipients: splitTargets($("alert-email-recipients").value),
+    telegram_enabled: $("alert-telegram-enabled").checked,
+    telegram_bot_token: $("alert-telegram-token").value.trim(),
+    telegram_chat_ids: splitTargets($("alert-telegram-chatids").value),
+  });
+  const load = async () => {
+    try {
+      const r = await fetch("/api/alerts/config", {cache:"no-store"});
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      $("alert-monitor-enabled").checked = Boolean(d.monitor_enabled);
+      $("alert-interval").value = String(d.interval_seconds || 60);
+      document.querySelectorAll('input[name="alert-severity"]').forEach(el => {el.checked = (d.severity_levels || [4,5]).includes(Number(el.value));});
+      const savedHostTypes = Array.isArray(d.host_type_filters) && d.host_type_filters.length
+        ? d.host_type_filters
+        : [d.host_type_filter || "all"];
+      const allHosts = savedHostTypes.includes("all");
+      document.querySelectorAll('input[name="alert-host-type"]').forEach(el => { el.checked = allHosts ? el.value === "all" : savedHostTypes.includes(el.value); });
+      $("alert-email-enabled").checked = Boolean(d.email_enabled);
+      $("alert-email-recipients").value = (d.email_recipients || []).join("\n");
+      $("alert-smtp-host").value = d.email_smtp_host || "";
+      $("alert-smtp-port").value = d.email_smtp_port || 587;
+      $("alert-smtp-security").value = d.email_security || "starttls";
+      $("alert-smtp-user").value = d.email_username || "";
+      $("alert-smtp-from").value = d.email_from || "";
+      $("alert-smtp-pass").value = "";
+      $("alert-smtp-pass").placeholder = d.email_password_saved ? "Senha já salva (campo em branco mantém)" : "Senha SMTP";
+      $("alert-smtp-pass-hint").textContent = d.email_password_saved ? "Já há uma senha salva; deixe em branco para mantê-la." : "A senha será salva localmente no arquivo de configuração do painel.";
+      $("alert-telegram-enabled").checked = Boolean(d.telegram_enabled);
+      $("alert-telegram-chatids").value = (d.telegram_chat_ids || []).join("\n");
+      $("alert-telegram-token").value = "";
+      $("alert-telegram-token").placeholder = d.telegram_bot_token_saved ? "Token já salvo (campo em branco mantém)" : "Token fornecido pelo BotFather";
+      $("alert-telegram-token-hint").textContent = d.telegram_bot_token_saved ? "Bot já configurado; deixe em branco para manter o token salvo." : "Crie um bot pelo @BotFather e informe o token.";
+    } catch (e) { feedback(`Não foi possível carregar a configuração de alertas: ${e.message}`, "error"); }
+    await refreshAlertStatus();
+  };
+  const save = async (runTest = false) => {
+    setBusy(true); feedback(runTest ? "Salvando e enviando testes…" : "Salvando configuração…");
+    try {
+      const requested = fields();
+      const r = await fetch("/api/alerts/config", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(requested)});
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      const saved = d.config || {};
+      const verifyPairs = [
+        ["Tipos de host", JSON.stringify(requested.host_type_filters), JSON.stringify(saved.host_type_filters || [])],
+        ["Severidades", JSON.stringify([...requested.severity_levels].sort((a,b)=>a-b)), JSON.stringify([...(saved.severity_levels || [])].sort((a,b)=>a-b))],
+        ["Servidor SMTP", requested.email_smtp_host, saved.email_smtp_host],
+        ["Porta SMTP", requested.email_smtp_port, saved.email_smtp_port],
+        ["Segurança SMTP", requested.email_security, saved.email_security],
+        ["Remetente", requested.email_from, saved.email_from]
+      ];
+      const mismatch = verifyPairs.find(([label, wanted, actual]) => wanted !== actual);
+      if (mismatch) throw new Error(`${mismatch[0]} não foi persistido corretamente (enviado: ${mismatch[1]}; recebido: ${mismatch[2]}). Confira o backend/versão do painel e tente novamente.`);
+      feedback(`Configuração salva e confirmada (${saved.config_saved_at || "agora"}).`, "success");
+      $("alert-smtp-pass").value = ""; $("alert-telegram-token").value = "";
+      await load();
+      if (runTest) {
+        feedback("Configuração salva. Enviando teste…");
+        const tr = await fetch("/api/alerts/test", {method:"POST"}); const td = await tr.json();
+        if (!tr.ok) throw new Error(td.detail || `HTTP ${tr.status}`);
+        const lines = Object.entries(td).map(([channel, result]) => `${channel === "email" ? "E-mail" : "Telegram"}: ${result.success ? "OK" : "FALHA"} — ${result.message}`);
+        const ok = Object.values(td).some(x => x.success) && Object.values(td).filter(x => x.message !== "Canal de e-mail desativado." && x.message !== "Canal do Telegram desativado.").every(x => x.success);
+        feedback(lines.join("\n"), ok ? "success" : "error");
+      }
+    } catch (e) { feedback(`Erro: ${e.message}`, "error"); }
+    finally { setBusy(false); await refreshAlertStatus(); }
+  };
+  const hostTypeBoxes = [...document.querySelectorAll('input[name="alert-host-type"]')];
+  const allHostBox = $("alert-host-all");
+  hostTypeBoxes.forEach(box => box.addEventListener("change", () => {
+    if (box.value === "all" && box.checked) {
+      hostTypeBoxes.forEach(other => { other.checked = other === box; });
+      return;
+    }
+    if (box.value !== "all" && box.checked) allHostBox.checked = false;
+    const selectedSpecific = hostTypeBoxes.some(other => other.value !== "all" && other.checked);
+    if (!selectedSpecific) allHostBox.checked = true;
+    if (allHostBox.checked) hostTypeBoxes.forEach(other => { if (other !== allHostBox) other.checked = false; });
+  }));
+  $("alert-save-btn").addEventListener("click", () => save(false));
+  $("alert-test-btn").addEventListener("click", () => save(true));
+  await load();
+}
+async function refreshAlertStatus() {
+  if (isPanelLayoutEditing()) return;
+  const revision = executiveDataRevision;
+  try {
+    const r = await fetch("/api/alerts/status", {cache:"no-store"});
+    if (isPanelLayoutEditing() || revision !== executiveDataRevision) return;
+    const s = await r.json();
+    if (isPanelLayoutEditing() || revision !== executiveDataRevision) return;
+    const pill = $("alerts-status-pill");
+    if (s.last_error) { pill.textContent = "Verificar configuração"; pill.className = "alert-status-pill error"; }
+    else if (s.monitor_enabled) { pill.textContent = "Monitoramento ativo"; pill.className = "alert-status-pill active"; }
+    else { pill.textContent = s.zabbix_configured ? "Monitoramento pausado" : "Zabbix não configurado"; pill.className = "alert-status-pill"; }
+    const bits = [];
+    if (s.last_poll) bits.push(`Última consulta: ${new Date(s.last_poll).toLocaleString("pt-BR")}`);
+    if (typeof s.active_problems === "number") bits.push(`${s.active_problems} problema(s) ativo(s) no Zabbix`);
+    if (typeof s.matched_problems === "number") bits.push(`${s.matched_problems} problema(s) passaram pelos filtros`);
+    if (typeof s.skipped_by_severity === "number" && s.skipped_by_severity) bits.push(`${s.skipped_by_severity} ignorado(s) por severidade não selecionada`);
+    if (typeof s.skipped_by_host_type === "number" && s.skipped_by_host_type) bits.push(`${s.skipped_by_host_type} ignorado(s) pelo tipo de host`);
+    if (typeof s.email_attempts === "number" && (s.email_attempts || s.email_sent || s.email_failures)) bits.push(`E-mail: ${s.email_sent || 0} enviado(s), ${s.email_failures || 0} falha(s) nesta consulta`);
+    if (typeof s.telegram_attempts === "number" && (s.telegram_attempts || s.telegram_sent || s.telegram_failures)) bits.push(`Telegram: ${s.telegram_sent || 0} enviado(s), ${s.telegram_failures || 0} falha(s) nesta consulta`);
+    if (typeof s.deduplicated_targets === "number" && s.deduplicated_targets) bits.push(`${s.deduplicated_targets} destino(s) já notificado(s) — duplicação evitada`);
+    if (s.last_decision) bits.push(`Diagnóstico: ${s.last_decision}`);
+    if (typeof s.notifications_sent === "number") bits.push(`${s.notifications_sent} evento(s) notificado(s) desde o início do processo`);
+    if (s.last_notification) bits.push(`Última notificação: ${new Date(s.last_notification).toLocaleString("pt-BR")}`);
+    if (s.last_error) bits.push(`Erro: ${s.last_error}`);
+    $("alert-runtime").textContent = bits.join(" · ") || "Salve e ative o monitoramento para começar a consultar problemas.";
+  } catch (e) {
+    if (!isPanelLayoutEditing() && revision === executiveDataRevision) $("alert-runtime").textContent = "Estado do monitor não disponível: " + e.message;
+  }
+}
+initAlertConfig();
+setInterval(refreshAlertStatus, 15000);
+
+function $(id){return document.getElementById(id)}
+</script></main></body></html>
